@@ -1,0 +1,257 @@
+# .github/workflows/streamhub-audio-pipeline.yml
+#
+# CI pipeline for the StreamHub demo audio validation system.
+#
+# Flow:
+#   unit-test  →  build-docker  →  integration
+#                                    ├─ Build Bridge binary (Go)
+#                                    ├─ Start Bridge (plain, --record-dir)
+#                                    ├─ Start StreamHub (Docker, --network=host)
+#                                    ├─ Connectivity health-check
+#                                    ├─ Run k6 pipeline  (run_pipeline.sh --k6-only)
+#                                    ├─ Python quality check
+#                                    ├─ Generate HTML report
+#                                    └─ Upload results/ as artifact
+
+name: StreamHub Audio Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - "**"
+      - ".github/workflows/streamhub-audio-pipeline.yml"
+  pull_request:
+    paths:
+      - "**"
+  workflow_dispatch:
+    inputs:
+      max_vus:
+        description: "Peak load VUs (ramp is auto-generated at 20%/50%/100% of this)"
+        default: "500"
+        required: false
+      chunk_ms:
+        description: "Audio chunk interval (ms)"
+        default: "20"
+        required: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/streamhub
+
+# ─── Job 1: Unit tests ────────────────────────────────────────────────────────
+jobs:
+  unit-test:
+    name: Go Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: go/go.mod
+
+      - name: Install protoc + plugins
+        working-directory: go
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q protobuf-compiler
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.4.0
+
+      - name: Generate proto stubs
+        working-directory: go
+        run: bash generate_proto.sh
+
+      - name: Run tests
+        working-directory: go
+        run: go test -v -race ./cmd/streamhub/... ./cmd/bridge/...
+
+  # ─── Job 2: Build & push StreamHub Docker image ───────────────────────────────
+  build-docker:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: unit-test
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image: ghcr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push StreamHub image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ghcr.io/${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─── Job 3: Integration — Bridge + StreamHub + k6 + quality + report ──────────
+  integration:
+    name: Integration & k6 Pipeline
+    runs-on: ubuntu-latest
+    needs: build-docker
+    permissions:
+      contents: read
+      packages: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Go setup (for building Bridge binary) ──────────────────────────────
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: go/go.mod
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── Install protoc (needed to build Bridge) ────────────────────────────
+      - name: Install protoc + plugins
+        working-directory: go
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q protobuf-compiler
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.4.0
+
+      - name: Generate proto stubs + build Bridge
+        working-directory: go
+        run: |
+          bash generate_proto.sh
+          go mod tidy
+          go build -o bin/bridge ./cmd/bridge
+          echo "Bridge binary: $(ls -lh bin/bridge)"
+
+      # ── Install k6 ─────────────────────────────────────────────────────────
+      - name: Install k6
+        run: |
+          sudo gpg --no-default-keyring \
+            --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 \
+            --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] \
+            https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update -q
+          sudo apt-get install -y k6
+          k6 version
+
+      # ── Install Python dependencies ────────────────────────────────────────
+      - name: Install Python dependencies
+        run: pip install -r scripts/requirements.txt
+
+      # ── Create runtime directories ─────────────────────────────────────────
+      - name: Create runtime directories
+        run: |
+          mkdir -p recordings
+          mkdir -p results
+
+      # ── Start Bridge (plain binary, with recording enabled) ────────────────
+      - name: Start Bridge
+        run: |
+          go/bin/bridge \
+            --port=50052 \
+            --record-dir=recordings &
+          echo "BRIDGE_PID=$!" >> "$GITHUB_ENV"
+          echo "Bridge started (PID $!)"
+
+      # ── Pull & start StreamHub Docker (--network=host so it reaches Bridge) ─
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start StreamHub Docker container
+        run: |
+          IMAGE="${{ needs.build-docker.outputs.image }}"
+          docker pull "$IMAGE"
+          docker run -d \
+            --name streamhub \
+            --network=host \
+            "$IMAGE" \
+            --ws-port=8765 \
+            --bridge-addr=127.0.0.1:50052
+          echo "StreamHub container started"
+
+      # ── Connectivity health-check ──────────────────────────────────────────
+      - name: Verify StreamHub → Bridge connectivity
+        run: |
+          echo "Checking services are reachable..."
+          for port in 50052 8765; do
+            echo -n "  :$port"
+            for i in $(seq 1 30); do
+              nc -z 127.0.0.1 "$port" 2>/dev/null && echo " ✓ ready" && break
+              echo -n "."
+              sleep 1
+            done
+            nc -z 127.0.0.1 "$port" || \
+              (echo " TIMEOUT — service did not start"; docker logs streamhub; exit 1)
+          done
+          echo "Both services healthy."
+
+      # ── Run k6 pipeline + quality check + report ──────────────────────────
+      - name: Run pipeline
+        env:
+          MAX_VUS: ${{ github.event.inputs.max_vus || '500' }}
+          CHUNK_MS: ${{ github.event.inputs.chunk_ms || '20' }}
+        run: |
+          bash run_pipeline.sh \
+            --k6-only \
+            --record=recordings \
+            --max-vus="$MAX_VUS" \
+            --chunk-ms="$CHUNK_MS" \
+            --audio=data/best_16k.wav
+
+      # ── Capture container logs for diagnostics ────────────────────────────
+      - name: Capture StreamHub logs
+        if: always()
+        run: docker logs streamhub 2>&1 | tee results/streamhub.log || true
+
+      # ── Teardown ──────────────────────────────────────────────────────────
+      - name: Stop services
+        if: always()
+        run: |
+          docker stop streamhub 2>/dev/null || true
+          docker rm   streamhub 2>/dev/null || true
+          kill "$BRIDGE_PID" 2>/dev/null || true
+
+      # ── Upload all results as a GitHub artifact ───────────────────────────
+      - name: Upload pipeline results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: streamhub-pipeline-${{ github.run_number }}-${{ github.run_attempt }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn

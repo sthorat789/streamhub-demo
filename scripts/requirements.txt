@@ -1,0 +1,8 @@
+# requirements.txt
+#
+# Dependencies for the StreamHub demo pipeline tools.
+# Install with:
+#   pip install -r scripts/requirements.txt
+
+# quality_check.py — pass-through integrity validation
+numpy>=1.24.0    # byte comparison + drop-map analysis

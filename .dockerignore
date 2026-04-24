@@ -1,0 +1,14 @@
+# Exclude generated and runtime artifacts from Docker build context.
+# The image only needs proto/ and go/ — everything else stays out.
+
+go/bin/
+go/pb/
+scripts/
+tests/
+data/
+recordings/
+results/
+.venv/
+*.html
+*.json
+.DS_Store

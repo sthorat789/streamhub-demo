@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package audioforward;
+
+// Go: import path = "streamhub/pb", package name = "pb"
+option go_package = "streamhub/pb;pb";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AudioForwardService — fixed topology:
+//
+//   k6 sender   ──(WebSocket binary)──────────► StreamHub  :8765
+//   StreamHub   ──(gRPC PushAudio)────────────► Bridge     :50052
+//   k6 receiver ◄──(gRPC ReceiveAudio)───────── Bridge     :50052
+//
+// StreamHub is a WebSocket SERVER and a gRPC CLIENT (go/cmd/streamhub/).
+// Bridge     is a pure gRPC SERVER                (go/cmd/bridge/).
+//
+// k6 measures latency, jitter, drop rate, buffer delay, and MOS client-side.
+// ─────────────────────────────────────────────────────────────────────────────
+service AudioForwardService {
+
+  // StreamHub calls this on Bridge to push PCM packets for a session.
+  // Each AudioPacket must have session_id set.  Send io.EOF to end the stream.
+  rpc PushAudio    (stream AudioPacket) returns (PushResult);
+
+  // k6 receiver calls this on Bridge to pull PCM packets for a session.
+  // Bridge streams every AudioPacket until the PushAudio stream closes.
+  rpc ReceiveAudio (ReceiveRequest)     returns (stream AudioPacket);
+}
+
+// ─── Messages ─────────────────────────────────────────────────────────────────
+
+// Sent by k6 receiver to subscribe to a session's audio stream.
+message ReceiveRequest {
+  // Must match the session_id sent by StreamHub in AudioPacket.session_id.
+  string session_id = 1;
+  // Seconds to wait for the session to appear before returning NOT_FOUND.
+  // Set > 0 when the receiver VU connects before the sender VU has started.
+  uint32 wait_s     = 2;
+}
+
+// Returned by Bridge when the PushAudio stream closes (StreamHub disconnects).
+message PushResult {
+  string session_id        = 1;  // echo of session_id from packets
+  uint64 packets_received  = 2;  // total packets accepted by Bridge
+  uint64 packets_dropped   = 3;  // dropped due to full channel buffer
+}
+
+// One chunk of raw 16-bit signed PCM audio.
+message AudioPacket {
+  // Monotonic per-session counter. Gaps indicate dropped packets.
+  uint64 seq         = 1;
+  // StreamHub wall-clock time in microseconds (UTC epoch) when this chunk
+  // arrived over WebSocket. k6 computes latency = Date.now()*1000 − send_ts_us.
+  int64  send_ts_us  = 2;
+  // Session identifier — must match ReceiveRequest.session_id.
+  string session_id  = 3;
+  uint32 sample_rate = 4;  // e.g. 16000
+  uint32 channels    = 5;  // 1 = mono, 2 = stereo
+  bytes  payload     = 6;  // raw PCM bytes (16-bit signed little-endian)
+}
