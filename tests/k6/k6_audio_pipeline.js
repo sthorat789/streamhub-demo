@@ -163,20 +163,20 @@ export const options = {
   },
 
   thresholds: {
-    // Reliable metrics only — these do not depend on per-packet Date.now()
-    // timestamps (which are batch-fired and therefore inaccurate in k6 gRPC).
+    // Reliable metrics — do not depend on per-packet Date.now() accuracy.
     fwd_sess_ok:       ["rate>0.95"],   // sessions that received all packets
     fwd_ws_ok:         ["rate>0.99"],   // WebSocket connection success
     fwd_ws_conn_ms:    ["p(95)<3000"],  // WS handshake time
     fwd_sess_drop_pct: ["avg<1"],       // packet sequence drop %
-    // fwd_pkt_latency_ms, fwd_sess_mos, fwd_first_pkt_ms are collected but
-    // not thresholded — k6 gRPC callbacks batch-fire, making Date.now()
-    // inside them reflect post-burst time, not true packet arrival time.
+    // Latency metrics: callbacks fire every 50 ms (polling tick), so
+    // Date.now() is accurate to ±50 ms — suitable for p95 gating.
+    fwd_pkt_latency_ms: ["p(95)<500"],  // end-to-end pipeline p95 < 500 ms
   },
 };
 
 // ─── Custom metrics ────────────────────────────────────────────────────────────
-// Informational latency metrics (not thresholded — batch-fired, see thresholds note)
+// Pipeline latency: Date.now() at receiver − send_ts_us (µs) from StreamHub.
+// Accurate to ±50 ms because callbacks fire every 50 ms polling tick.
 const pktLatency   = new Trend("fwd_pkt_latency_ms",    true);
 const firstPktMs   = new Trend("fwd_first_pkt_ms",      true);
 const sessLatMean  = new Trend("fwd_sess_lat_mean_ms",  true);
@@ -240,7 +240,6 @@ export function receiveAudio() {
   const stream = new Stream(grpcClient, "audioforward.AudioForwardService/ReceiveAudio");
   let grpcClosed = false;
   function closeGrpc() { if (!grpcClosed) { grpcClosed = true; grpcClient.close(); } }
-
   // Bucket histogram instead of latencies[] array.
   // 20 buckets × 50 ms covers 0–1000 ms; beyond that lands in bucket 19.
   let latSum       = 0;
@@ -250,19 +249,20 @@ export function receiveAudio() {
   let pktsRecvd    = 0;
   let prevTransit  = null;  // RFC 3550 smoothed jitter state
   let jitter       = 0;     // running smoothed jitter in µs
-  let streamEnded  = false;
   let firstPktSeen = false;
-  let startTs      = 0;     // set just before stream.write()
+  let streamEnded  = false; // set true by "end"/"error" to exit polling loop
+  const startTs    = Date.now();
 
   stream.on("data", (pkt) => {
     // proto3 int64 fields arrive as lowerCamelCase via proto3 JSON mapping.
-    // send_ts_us → sendTsUs. k6 gRPC returns int64 as a decimal string.
-    const recvUs  = Number(BigInt(Date.now()) * 1000n);
+    // send_ts_us → sendTsUs. k6 returns int64 as a decimal string.
+    // Date.now() is accurate to ±50 ms because we poll every 50 ms (see below).
+    const recvUs    = Number(BigInt(Date.now()) * 1000n);
     const rawSendTs = pkt.sendTsUs;
-    const seq     = parseInt(pkt.seq || "0", 10);
+    const seq       = parseInt(pkt.seq || "0", 10);
 
-    // Guard: skip latency measurement for packets with no server timestamp.
-    // Using || "0" fallback would produce latMs ≈ Date.now() (billions of ms)
+    // Guard: skip packets with no StreamHub timestamp.
+    // Using a "0" fallback would produce latMs ≈ Date.now() (billions of ms)
     // which poisons every Trend metric and collapses MOS to 1.0.
     if (!rawSendTs || rawSendTs === "0" || rawSendTs === 0) {
       cntNoTs.add(1);
@@ -271,10 +271,10 @@ export function receiveAudio() {
       seqLast = seq;
       return;
     }
-    const sendUs  = Number(BigInt(rawSendTs));
-    const latMs   = (recvUs - sendUs) / 1000;
+    const sendUs = Number(BigInt(rawSendTs));
+    const latMs  = (recvUs - sendUs) / 1000;
 
-    // Time-to-first-packet (informational — see threshold notes).
+    // Time-to-first-packet.
     if (!firstPktSeen) {
       firstPktSeen = true;
       firstPktMs.add(Date.now() - startTs);
@@ -308,7 +308,6 @@ export function receiveAudio() {
       console.error(`[load][${sid}] stream ended with 0 packets`);
       sessOk.add(0);
       closeGrpc();
-      streamEnded = true;
       return;
     }
 
@@ -341,32 +340,26 @@ export function receiveAudio() {
       );
     }
 
-    closeGrpc();
     streamEnded = true;
+    closeGrpc();
   });
 
   stream.on("error", (err) => {
     console.error(`[load][${sid}] gRPC error: ${err.message || JSON.stringify(err)}`);
     sessOk.add(0);
-    closeGrpc();
     streamEnded = true;
+    closeGrpc();
   });
 
-  // startTs is captured here so fwd_first_pkt_ms reflects only the time from
-  // registration until first packet arrives (i.e. includes sender start delay
-  // SENDER_START_S, but not VU init overhead).
-  startTs = Date.now();
   stream.write({ session_id: sid, wait_s: WAIT_S });
-  // Half-close the client side — correct for server-streaming RPCs.
-  stream.end();
+  stream.end(); // half-close — correct for server-streaming RPCs
 
-  // Pump the k6 event loop in short increments so that gRPC "data" callbacks
-  // fire as packets arrive (real-time), not all batched after a long sleep().
-  const deadline = Date.now() + SESSION_LIFE_S * 1000;
-  while (!streamEnded && Date.now() < deadline) {
-    sleep(0.1);
-  }
-  closeGrpc(); // safety-net: close if deadline hit before stream ended
+  // Poll every 50 ms so k6's event loop can fire "data" callbacks as packets
+  // arrive. With a 50 ms tick, Date.now() inside each callback is accurate to
+  // ±50 ms — good enough for real latency measurement. A single sleep(N) would
+  // batch-fire all callbacks at once, making every timestamp identical.
+  while (!streamEnded) { sleep(0.05); }
+  closeGrpc(); // safety-net if stream never ended
 }
 
 // ─── Scenario: sendAudio ──────────────────────────────────────────────────────
