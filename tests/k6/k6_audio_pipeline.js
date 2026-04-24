@@ -95,10 +95,6 @@ console.log(
   `  ${DURATION_S.toFixed(1)} s  chunk=${CHUNK_BYTES} B @ ${CHUNK_MS} ms`
 );
 console.log(`gRPC receiver → ${BRIDGE_GRPC_ADDR}  WS sender → ${WS_URL}`);
-console.log(
-  `Load profile (MAX_VUS=${MAX_VUS}): ` +
-  LOAD_STAGES.map((s) => `${s.duration}→${s.target}`).join("  ")
-);
 
 // ─── Timing ────────────────────────────────────────────────────────────────────
 // Sender starts this many seconds after receiver (within every phase).
@@ -129,6 +125,11 @@ function buildLoadStages(peak) {
   ];
 }
 const LOAD_STAGES = buildLoadStages(MAX_VUS);
+
+console.log(
+  `Load profile (MAX_VUS=${MAX_VUS}): ` +
+  LOAD_STAGES.map((s) => `${s.duration}→${s.target}`).join("  ")
+);
 
 // Allow in-flight sessions to finish naturally during ramp-down / scenario end.
 const GRACEFUL_S = SESSION_LIFE_S + "s";
@@ -237,10 +238,12 @@ function eModelMOS(latMs, dropFrac) {
 
 export function receiveAudio() {
   const sid   = sessionId();
-  const phase = exec.scenario.tags.phase;
+  const phase = exec.scenario.name.startsWith("baseline") ? "baseline" : "load";
 
   grpcClient.connect(BRIDGE_GRPC_ADDR, { plaintext: true });
   const stream = new Stream(grpcClient, "audioforward.AudioForwardService/ReceiveAudio");
+  let grpcClosed = false;
+  function closeGrpc() { if (!grpcClosed) { grpcClosed = true; grpcClient.close(); } }
 
   const latencies = [];
   let seqLast     = -1;
@@ -274,7 +277,7 @@ export function receiveAudio() {
     if (!pktsRecvd) {
       console.error(`[${phase}][${sid}] stream ended with 0 packets`);
       sessOk.add(0);
-      grpcClient.close();
+      closeGrpc();
       return;
     }
 
@@ -308,13 +311,13 @@ export function receiveAudio() {
       `  MOS=${mos.toFixed(2)}`
     );
 
-    grpcClient.close();
+    closeGrpc();
   });
 
   stream.on("error", (err) => {
     console.error(`[${phase}][${sid}] gRPC error: ${err.message || JSON.stringify(err)}`);
     sessOk.add(0);
-    grpcClient.close();
+    closeGrpc();
   });
 
   stream.write({ session_id: sid, wait_s: WAIT_S });
@@ -327,7 +330,7 @@ export function receiveAudio() {
 
 export function sendAudio() {
   const sid    = sessionId();
-  const phase  = exec.scenario.tags.phase;
+  const phase  = exec.scenario.name.startsWith("baseline") ? "baseline" : "load";
   const tStart = Date.now();
 
   const res = ws.connect(WS_URL, {}, (socket) => {
