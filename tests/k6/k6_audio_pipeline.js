@@ -256,6 +256,7 @@ export function receiveAudio() {
   let prevRecvUs  = null;
   let prevSendUs  = null;
   let jitterSum   = 0;
+  let streamEnded = false;
 
   stream.on("data", (pkt) => {
     // proto3 int64 fields arrive as camelCase in k6's gRPC client (JSON mapping).
@@ -320,16 +321,29 @@ export function receiveAudio() {
     );
 
     closeGrpc();
+    streamEnded = true;
   });
 
   stream.on("error", (err) => {
     console.error(`[${phase}][${sid}] gRPC error: ${err.message || JSON.stringify(err)}`);
     sessOk.add(0);
     closeGrpc();
+    streamEnded = true;
   });
 
   stream.write({ session_id: sid, wait_s: WAIT_S });
-  sleep(SESSION_LIFE_S);
+  // Half-close the client side — correct for server-streaming RPCs.
+  // Without this, k6's bidirectional Stream may not flush END_STREAM to the server.
+  stream.end();
+
+  // Pump the k6 event loop in short increments so that gRPC "data" callbacks
+  // fire as packets arrive (real-time), not all batched after a long sleep().
+  // A single sleep(SESSION_LIFE_S) queues all callbacks and delivers them at once,
+  // making Date.now() in the handler useless for latency measurement.
+  const deadline = Date.now() + SESSION_LIFE_S * 1000;
+  while (!streamEnded && Date.now() < deadline) {
+    sleep(0.1);
+  }
 }
 
 // ─── Scenario: sendAudio ──────────────────────────────────────────────────────
