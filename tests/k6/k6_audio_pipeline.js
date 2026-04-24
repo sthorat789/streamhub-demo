@@ -28,10 +28,8 @@
  * ── Usage (from repo root) ────────────────────────────────────────────────────
  *   k6 run tests/k6/k6_audio_pipeline.js
  *
- *   # custom addresses
- *   k6 run --env WS_URL=ws://streamhub:8765 \
- *           --env BRIDGE_GRPC_ADDR=bridge:50052 \
- *           tests/k6/k6_audio_pipeline.js
+ *   # or from any directory — proto path is relative to the script file
+ *   k6 run /path/to/streamhub-demo/tests/k6/k6_audio_pipeline.js
  *
  * ── Configuration (--env) ─────────────────────────────────────────────────────
  *   WS_URL            StreamHub WebSocket URL   (default: ws://127.0.0.1:8765)
@@ -59,8 +57,9 @@ const MAX_VUS          = parseInt(__ENV.MAX_VUS   || "500", 10);
 
 // ─── gRPC client — init context ────────────────────────────────────────────────
 const grpcClient = new Client();
-grpcClient.load(["./proto"], "audio_forward.proto");
-// proto/ lives at the repo root; always run k6 from the repo root.
+grpcClient.load(["../../proto"], "audio_forward.proto");
+// k6 resolves load() paths relative to the script file (tests/k6/),
+// so ../../proto points to proto/ at the repo root.
 
 // ─── WAV loading & parsing — init context ──────────────────────────────────────
 const wavBuffer = open(AUDIO_FILE, "b");
