@@ -163,14 +163,16 @@ export const options = {
   },
 
   thresholds: {
-    fwd_sess_ok:          ["rate>0.95"],  // ≥95% sessions received all packets
-    fwd_ws_ok:            ["rate>0.99"],  // ≥99% WS connections succeed (StreamHub health)
-    fwd_ws_conn_ms:       ["p(95)<3000"],// WS handshake p95 < 3 s (StreamHub under load)
-    fwd_sess_drop_pct:    ["avg<1"],      // average session drop rate < 1%
-    fwd_pkt_latency_ms:   ["p(95)<500"], // end-to-end pipeline p95 < 500 ms
-    fwd_sess_jitter_ms:   ["avg<50"],    // mean per-session IPDV < 50 ms
-    // fwd_sess_lat_drift_ms: informational only — positive = StreamHub adding delay,
-    // no drift + drops = StreamHub corruption/dropping packets upstream.
+    fwd_sess_ok:       ["rate>0.95"],  // ≥95% sessions received all packets
+    fwd_ws_ok:         ["rate>0.99"],  // ≥99% WS connections succeed
+    fwd_ws_conn_ms:    ["p(95)<3000"],// WS handshake p95 < 3 s
+    fwd_sess_drop_pct: ["avg<1"],      // average session drop rate < 1%
+    fwd_sess_jitter_ms:["avg<50"],    // mean per-session IPDV < 50 ms
+    // fwd_pkt_latency_ms: NOT thresholded — k6 gRPC "data" callbacks are dispatched
+    // asynchronously (all fire at once after grpcClient.close()), so Date.now() inside
+    // them returns the same post-close timestamp, making latency values wrong.
+    // fwd_sess_lat_drift_ms: informational — positive drift = StreamHub buffering/adding
+    // delay; near-zero drift + drops = StreamHub corrupting/dropping packets.
   },
 };
 
@@ -322,29 +324,32 @@ export function receiveAudio() {
   });
 
   stream.on("end", () => {
+    // Signal the polling loop to exit. Do NOT call closeGrpc() here —
+    // we deliberately close from the main flow so we can sleep() afterwards
+    // to let buffered "data" callbacks drain before flush() reads the state.
     streamCleanly = true;
     streamEnded   = true;
-    closeGrpc();
   });
 
   stream.on("error", (err) => {
     console.error(`[${sid}] gRPC error: ${err.message || JSON.stringify(err)}`);
     streamEnded = true;
-    closeGrpc();
   });
 
   stream.write({ session_id: sid, wait_s: WAIT_S });
   stream.end(); // half-close — correct for server-streaming RPCs
 
-  // Poll every 50 ms — each wakeup drains buffered "data" callbacks so
-  // Date.now() is accurate to ±50 ms. Hard deadline = SESSION_LIFE_S so
-  // this loop always exits and flush() always records metrics, even when
-  // k6 interrupts the iteration before the "end" event fires.
+  // Wait for "end" (or deadline) in 50 ms ticks.
   const deadline = Date.now() + SESSION_LIFE_S * 1000;
   while (!streamEnded && Date.now() < deadline) { sleep(0.05); }
 
-  flush();    // always record whatever was accumulated
+  // Close the gRPC connection. k6 dispatches buffered "data" callbacks
+  // asynchronously when the connection closes. The sleep() below yields to
+  // the event loop so those callbacks fire and populate pktsRecvd, jitter, etc.
+  // before flush() reads them.
   closeGrpc();
+  sleep(0.5);   // drain async data callbacks
+  flush();      // record per-session metrics now that state is populated
 }
 
 // ─── Scenario: sendAudio ──────────────────────────────────────────────────────
