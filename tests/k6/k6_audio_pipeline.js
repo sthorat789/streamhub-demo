@@ -34,7 +34,8 @@
  * ── Configuration (--env) ─────────────────────────────────────────────────────
  *   WS_URL            StreamHub WebSocket URL   (default: ws://127.0.0.1:8765)
  *   BRIDGE_GRPC_ADDR  Bridge gRPC address       (default: 127.0.0.1:50052)
- *   AUDIO_FILE        WAV file path             (default: data/best_16k.wav)
+ *   AUDIO_FILE        WAV file path             (default: ../../data/best_16k.wav)
+ *                     Paths are relative to the script file (tests/k6/), not CWD.
  *   CHUNK_MS          Chunk interval ms         (default: 20)
  *   WAIT_S            Bridge session wait s     (default: 10)
  *   MAX_VUS           Peak / stable VU count for load phase (default: 500)
@@ -50,7 +51,7 @@ import exec                  from "k6/execution";
 // ─── Configuration ─────────────────────────────────────────────────────────────
 const WS_URL           = __ENV.WS_URL           || "ws://127.0.0.1:8765";
 const BRIDGE_GRPC_ADDR = __ENV.BRIDGE_GRPC_ADDR || "127.0.0.1:50052";
-const AUDIO_FILE       = __ENV.AUDIO_FILE       || "data/best_16k.wav";
+const AUDIO_FILE       = __ENV.AUDIO_FILE       || "../../data/best_16k.wav";
 const CHUNK_MS         = parseInt(__ENV.CHUNK_MS  || "20",  10);
 const WAIT_S           = parseInt(__ENV.WAIT_S    || "10",  10);
 const MAX_VUS          = parseInt(__ENV.MAX_VUS   || "500", 10);

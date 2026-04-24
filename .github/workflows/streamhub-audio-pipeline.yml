@@ -239,6 +239,8 @@ jobs:
             --max-vus="$MAX_VUS" \
             --chunk-ms="$CHUNK_MS" \
             --audio=data/best_16k.wav
+          # Note: run_pipeline.sh converts AUDIO_FILE to an absolute path before
+          # passing it to k6, so k6's open() (script-relative) receives a full path.
 
       # ── Capture container logs for diagnostics ────────────────────────────
       - name: Capture StreamHub logs

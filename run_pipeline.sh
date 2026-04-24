@@ -178,11 +178,14 @@ if [[ "$NO_K6" == false ]]; then
   echo "==> Running k6  max_vus=$MAX_VUS  chunk_ms=$CHUNK_MS  audio=$AUDIO_FILE"
   echo "──────────────────────────────────────────────────────────────────"
   cd "$SCRIPT_DIR"
+  # k6 open() resolves AUDIO_FILE relative to the script file, not CWD.
+  # Pass an absolute path so it works regardless of where k6 is invoked from.
+  K6_AUDIO_FILE="$SCRIPT_DIR/$AUDIO_FILE"
   k6 run \
     --summary-export "$RESULTS_DIR/k6_summary.json" \
     --env WS_URL="ws://127.0.0.1:$WS_PORT" \
     --env BRIDGE_GRPC_ADDR="127.0.0.1:$BRIDGE_PORT" \
-    --env AUDIO_FILE="$AUDIO_FILE" \
+    --env AUDIO_FILE="$K6_AUDIO_FILE" \
     --env CHUNK_MS="$CHUNK_MS" \
     --env MAX_VUS="$MAX_VUS" \
     --env WAIT_S="$WAIT_S" \
