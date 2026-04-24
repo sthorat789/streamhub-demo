@@ -258,11 +258,12 @@ export function receiveAudio() {
   let jitterSum   = 0;
 
   stream.on("data", (pkt) => {
-    // proto3 int64 arrives as a decimal string in k6's gRPC client.
-    // Use BigInt for subtraction — these are 16-digit µs values that exceed
-    // Number.MAX_SAFE_INTEGER, so plain parseInt loses precision → MOS=1.
+    // proto3 int64 fields arrive as camelCase in k6's gRPC client (JSON mapping).
+    // send_ts_us → sendTsUs. Also, values > Number.MAX_SAFE_INTEGER must use
+    // BigInt to avoid precision loss. Current µs timestamps are ~1.7×10¹⁵ which
+    // is within JS safe range, but BigInt is safer for future-proofing.
     const recvUsB  = BigInt(Date.now()) * 1000n;
-    const sendUsB  = BigInt(pkt.send_ts_us || "0");
+    const sendUsB  = BigInt(pkt.sendTsUs || "0");
     const seq      = parseInt(pkt.seq || "0", 10);
 
     const latMs = Number(recvUsB - sendUsB) / 1000;
