@@ -30,6 +30,14 @@ on:
         description: "Peak load VUs (ramp is auto-generated at 20%/50%/100% of this)"
         default: "500"
         required: false
+      ramp_duration:
+        description: "Duration per ramp stage (e.g. 10s, 1m)"
+        default: "1m"
+        required: false
+      stable_duration:
+        description: "Duration of stable peak stage (e.g. 30s, 3m)"
+        default: "3m"
+        required: false
       chunk_ms:
         description: "Audio chunk interval (ms)"
         default: "20"
@@ -230,13 +238,19 @@ jobs:
       # ── Run k6 pipeline + quality check + report ──────────────────────────
       - name: Run pipeline
         env:
-          MAX_VUS: ${{ github.event.inputs.max_vus || '500' }}
-          CHUNK_MS: ${{ github.event.inputs.chunk_ms || '20' }}
+          # CI defaults: 10 VUs with short stages to avoid OOM on 2-CPU/7.75GB runner.
+          # Override via workflow_dispatch inputs for a real load run.
+          MAX_VUS:         ${{ github.event.inputs.max_vus        || '10' }}
+          RAMP_DURATION:   ${{ github.event.inputs.ramp_duration  || '10s' }}
+          STABLE_DURATION: ${{ github.event.inputs.stable_duration || '30s' }}
+          CHUNK_MS:        ${{ github.event.inputs.chunk_ms       || '20' }}
         run: |
           bash run_pipeline.sh \
             --k6-only \
             --record=recordings \
             --max-vus="$MAX_VUS" \
+            --ramp-duration="$RAMP_DURATION" \
+            --stable-duration="$STABLE_DURATION" \
             --chunk-ms="$CHUNK_MS" \
             --audio=data/best_16k.wav
           # Note: run_pipeline.sh converts AUDIO_FILE to an absolute path before

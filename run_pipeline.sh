@@ -16,6 +16,8 @@
 #   --bridge-port=PORT Bridge gRPC port               (default: 50052)
 #   --chunk-ms=N       Audio chunk interval ms        (default: 20)
 #   --max-vus=N        Peak load VUs (ramp shape is auto-generated) (default: 500)
+#   --ramp-duration=T  k6 duration per ramp stage        (default: 1m)
+#   --stable-duration=T k6 stable peak stage duration    (default: 3m)
 #   --audio=PATH       WAV file (relative to repo root) (default: data/best_16k.wav)
 #   --wait-s=N         Bridge session wait timeout    (default: 10)
 #   --record[=DIR]     Record sessions to DIR         (default: recordings/)
@@ -34,6 +36,8 @@ WS_PORT=8765
 BRIDGE_PORT=50052
 CHUNK_MS=20
 MAX_VUS=500
+RAMP_DURATION="1m"
+STABLE_DURATION="3m"
 AUDIO_FILE="data/best_16k.wav"
 WAIT_S=10
 K6_ONLY=false
@@ -47,6 +51,8 @@ for arg in "$@"; do
     --bridge-port=*)  BRIDGE_PORT="${arg#*=}"  ;;
     --chunk-ms=*)     CHUNK_MS="${arg#*=}"     ;;
     --max-vus=*)      MAX_VUS="${arg#*=}"      ;;
+    --ramp-duration=*)   RAMP_DURATION="${arg#*=}"   ;;
+    --stable-duration=*) STABLE_DURATION="${arg#*=}" ;;
     --audio=*)        AUDIO_FILE="${arg#*=}"   ;;
     --wait-s=*)       WAIT_S="${arg#*=}"       ;;
     --record)         RECORD_DIR="$SCRIPT_DIR/recordings" ;;
@@ -175,7 +181,7 @@ fi
 # ─── k6 ────────────────────────────────────────────────────────────────────────
 if [[ "$NO_K6" == false ]]; then
   echo ""
-  echo "==> Running k6  max_vus=$MAX_VUS  chunk_ms=$CHUNK_MS  audio=$AUDIO_FILE"
+  echo "==> Running k6  max_vus=$MAX_VUS  ramp=$RAMP_DURATION  stable=$STABLE_DURATION  chunk_ms=$CHUNK_MS  audio=$AUDIO_FILE"
   echo "──────────────────────────────────────────────────────────────────"
   cd "$SCRIPT_DIR"
   # k6 open() resolves AUDIO_FILE relative to the script file, not CWD.
@@ -188,6 +194,8 @@ if [[ "$NO_K6" == false ]]; then
     --env AUDIO_FILE="$K6_AUDIO_FILE" \
     --env CHUNK_MS="$CHUNK_MS" \
     --env MAX_VUS="$MAX_VUS" \
+    --env RAMP_DURATION="$RAMP_DURATION" \
+    --env STABLE_DURATION="$STABLE_DURATION" \
     --env WAIT_S="$WAIT_S" \
     tests/k6/k6_audio_pipeline.js
   echo ""

@@ -40,6 +40,8 @@
  *   WAIT_S            Bridge session wait s     (default: 10)
  *   MAX_VUS           Peak / stable VU count for load phase (default: 500)
  *                     Ramp breakpoints are auto-generated at 20%, 50%, 100%.
+ *   RAMP_DURATION     Duration of each ramp stage        (default: 1m)
+ *   STABLE_DURATION   Duration of stable peak stage       (default: 3m)
  */
 
 import ws                    from "k6/ws";
@@ -54,7 +56,9 @@ const BRIDGE_GRPC_ADDR = __ENV.BRIDGE_GRPC_ADDR || "127.0.0.1:50052";
 const AUDIO_FILE       = __ENV.AUDIO_FILE       || "../../data/best_16k.wav";
 const CHUNK_MS         = parseInt(__ENV.CHUNK_MS  || "20",  10);
 const WAIT_S           = parseInt(__ENV.WAIT_S    || "10",  10);
-const MAX_VUS          = parseInt(__ENV.MAX_VUS   || "500", 10);
+const MAX_VUS          = parseInt(__ENV.MAX_VUS        || "500", 10);
+const RAMP_DURATION    = __ENV.RAMP_DURATION   || "1m";
+const STABLE_DURATION  = __ENV.STABLE_DURATION || "3m";
 
 // ─── gRPC client — init context ────────────────────────────────────────────────
 const grpcClient = new Client();
@@ -115,13 +119,13 @@ function buildLoadStages(peak) {
   const p20 = Math.max(1, Math.round(peak * 0.20));
   const p50 = Math.max(1, Math.round(peak * 0.50));
   return [
-    { duration: "1m", target: p20  },  // ramp   0 → 20%
-    { duration: "1m", target: p50  },  // ramp  20% → 50%
-    { duration: "1m", target: peak },  // ramp  50% → peak
-    { duration: "3m", target: peak },  // stable peak
-    { duration: "1m", target: p50  },  // ramp peak → 50%
-    { duration: "1m", target: p20  },  // ramp  50% → 20%
-    { duration: "1m", target: 0    },  // ramp  20% → 0
+    { duration: RAMP_DURATION,   target: p20  },  // ramp   0 → 20%
+    { duration: RAMP_DURATION,   target: p50  },  // ramp  20% → 50%
+    { duration: RAMP_DURATION,   target: peak },  // ramp  50% → peak
+    { duration: STABLE_DURATION, target: peak },  // stable peak
+    { duration: RAMP_DURATION,   target: p50  },  // ramp peak → 50%
+    { duration: RAMP_DURATION,   target: p20  },  // ramp  50% → 20%
+    { duration: RAMP_DURATION,   target: 0    },  // ramp  20% → 0
   ];
 }
 const LOAD_STAGES = buildLoadStages(MAX_VUS);
