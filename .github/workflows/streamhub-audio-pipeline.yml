@@ -66,6 +66,10 @@ jobs:
         working-directory: go
         run: bash generate_proto.sh
 
+      - name: Tidy modules
+        working-directory: go
+        run: go mod tidy
+
       - name: Run tests
         working-directory: go
         run: go test -v -race ./cmd/streamhub/... ./cmd/bridge/...
