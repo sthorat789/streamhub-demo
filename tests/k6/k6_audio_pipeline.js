@@ -92,11 +92,13 @@ const BYTES_PER_MS = (wav.sampleRate * (wav.bitsPerSample / 8) * wav.channels) /
 const CHUNK_BYTES  = Math.max(1, Math.floor(CHUNK_MS * BYTES_PER_MS));
 const DURATION_S   = wav.dataSize / (BYTES_PER_MS * 1000);
 
-console.log(
-  `WAV: ${AUDIO_FILE}  ${wav.sampleRate} Hz  ch=${wav.channels}` +
-  `  ${DURATION_S.toFixed(1)} s  chunk=${CHUNK_BYTES} B @ ${CHUNK_MS} ms`
-);
-console.log(`gRPC receiver → ${BRIDGE_GRPC_ADDR}  WS sender → ${WS_URL}`);
+if (__VU === 0) {
+  console.log(
+    `WAV: ${AUDIO_FILE}  ${wav.sampleRate} Hz  ch=${wav.channels}` +
+    `  ${DURATION_S.toFixed(1)} s  chunk=${CHUNK_BYTES} B @ ${CHUNK_MS} ms`
+  );
+  console.log(`gRPC receiver → ${BRIDGE_GRPC_ADDR}  WS sender → ${WS_URL}`);
+}
 
 // ─── Timing ────────────────────────────────────────────────────────────────────
 // Sender starts this many seconds after receiver (within every phase).
@@ -125,10 +127,12 @@ function buildLoadStages(peak) {
 }
 const LOAD_STAGES = buildLoadStages(MAX_VUS);
 
-console.log(
-  `Load profile (MAX_VUS=${MAX_VUS}): ` +
-  LOAD_STAGES.map((s) => `${s.duration}→${s.target}`).join("  ")
-);
+if (__VU === 0) {
+  console.log(
+    `Load profile (MAX_VUS=${MAX_VUS}): ` +
+    LOAD_STAGES.map((s) => `${s.duration}→${s.target}`).join("  ")
+  );
+}
 
 // Allow in-flight sessions to finish naturally during ramp-down / scenario end.
 const GRACEFUL_S = SESSION_LIFE_S + "s";
