@@ -345,6 +345,7 @@ export function receiveAudio() {
 
   flush();    // always record whatever was accumulated
   closeGrpc();
+}
 
 // ─── Scenario: sendAudio ──────────────────────────────────────────────────────
 // Used by both load_receiver and load_sender (sendAudio).
