@@ -254,11 +254,14 @@ export function receiveAudio() {
   let jitterSum   = 0;
 
   stream.on("data", (pkt) => {
-    const recvUs = Date.now() * 1000;
-    const sendUs = parseInt(pkt.send_ts_us || "0", 10); // int64 arrives as string
-    const seq    = parseInt(pkt.seq        || "0", 10);
+    // proto3 int64 arrives as a decimal string in k6's gRPC client.
+    // Use BigInt for subtraction — these are 16-digit µs values that exceed
+    // Number.MAX_SAFE_INTEGER, so plain parseInt loses precision → MOS=1.
+    const recvUsB  = BigInt(Date.now()) * 1000n;
+    const sendUsB  = BigInt(pkt.send_ts_us || "0");
+    const seq      = parseInt(pkt.seq || "0", 10);
 
-    const latMs = (recvUs - sendUs) / 1000;
+    const latMs = Number(recvUsB - sendUsB) / 1000;
     latencies.push(latMs);
     pktsRecvd++;
     pktLatency.add(latMs);
@@ -267,10 +270,10 @@ export function receiveAudio() {
     seqLast = seq;
 
     if (prevRecvUs !== null) {
-      jitterSum += Math.abs((recvUs - prevRecvUs) - (sendUs - prevSendUs));
+      jitterSum += Math.abs(Number(recvUsB - prevRecvUs) - Number(sendUsB - prevSendUs));
     }
-    prevRecvUs = recvUs;
-    prevSendUs = sendUs;
+    prevRecvUs = recvUsB;
+    prevSendUs = sendUsB;
   });
 
   stream.on("end", () => {
