@@ -59,6 +59,7 @@ const WAIT_S           = parseInt(__ENV.WAIT_S    || "10",  10);
 const MAX_VUS          = parseInt(__ENV.MAX_VUS        || "500", 10);
 const RAMP_DURATION    = __ENV.RAMP_DURATION   || "1m";
 const STABLE_DURATION  = __ENV.STABLE_DURATION || "3m";
+const DEBUG            = __ENV.DEBUG === "1";
 
 // ─── gRPC client — init context ────────────────────────────────────────────────
 const grpcClient = new Client();
@@ -108,8 +109,9 @@ const SENDER_START_S = 5;
 // How long one full audio session lasts end-to-end.
 const SESSION_LIFE_S = Math.ceil(SENDER_START_S + DURATION_S + WAIT_S + 20);
 
-// Phase 1 (baseline) ends SESSION_LIFE_S + 30 s buffer after t=0.
-const BASELINE_END_S = SESSION_LIFE_S + 30;
+// Phase 1 (baseline) ends SESSION_LIFE_S + 60 s buffer after t=0.
+// Extra gap avoids lingering baseline sockets polluting load-phase metrics.
+const BASELINE_END_S = SESSION_LIFE_S + 60;
 
 // Phase 2 ramp schedule — generated from MAX_VUS.
 // Shape: ramp to 20% → 50% → 100% (stable 3m) → 50% → 20% → 0.
@@ -188,7 +190,9 @@ export const options = {
   thresholds: {
     // Applied across both phases; baseline values inform whether load passes.
     fwd_sess_ok:        ["rate>0.95"],
+    fwd_ws_ok:          ["rate>0.99"],
     fwd_ws_conn_ms:     ["p(95)<3000"],
+    fwd_first_pkt_ms:   ["p(95)<" + (SENDER_START_S * 1000 + 3000)],
     fwd_pkt_latency_ms: ["p(95)<500"],
     fwd_sess_mos:       ["avg>3.5"],
     fwd_sess_drop_pct:  ["avg<1"],
@@ -208,8 +212,11 @@ const sessMOS      = new Trend("fwd_sess_mos",          true);
 const cntExpected  = new Counter("fwd_pkts_expected");
 const cntReceived  = new Counter("fwd_pkts_received");
 const cntDropped   = new Counter("fwd_pkts_dropped");
+const cntNoTs      = new Counter("fwd_pkts_no_timestamp"); // pkts with missing send_ts_us
 const wsConnMs     = new Trend("fwd_ws_conn_ms",        true);
+const firstPktMs   = new Trend("fwd_first_pkt_ms",      true);
 const sessOk       = new Rate("fwd_sess_ok");
+const wsOk         = new Rate("fwd_ws_ok");
 
 // ─── Session ID ────────────────────────────────────────────────────────────────
 // Uses exec.scenario.iterationInTest — a per-scenario global counter that
@@ -249,25 +256,51 @@ export function receiveAudio() {
   let grpcClosed = false;
   function closeGrpc() { if (!grpcClosed) { grpcClosed = true; grpcClient.close(); } }
 
-  const latencies = [];
-  let seqLast     = -1;
-  let pktsDropped = 0;
-  let pktsRecvd   = 0;
-  let prevRecvUs  = null;
-  let prevSendUs  = null;
-  let jitterSum   = 0;
-  let streamEnded = false;
+  const latencies  = [];
+  let seqLast      = -1;
+  let pktsDropped  = 0;
+  let pktsRecvd    = 0;
+  let prevTransit  = null;  // RFC 3550 smoothed jitter state
+  let jitter       = 0;     // running smoothed jitter in µs
+  let streamEnded  = false;
+  let firstPktSeen = false;
+  let startTs      = 0;     // set when stream.write() is called (see below)
 
   stream.on("data", (pkt) => {
-    // proto3 int64 fields arrive as camelCase in k6's gRPC client (JSON mapping).
-    // send_ts_us → sendTsUs. Also, values > Number.MAX_SAFE_INTEGER must use
-    // BigInt to avoid precision loss. Current µs timestamps are ~1.7×10¹⁵ which
-    // is within JS safe range, but BigInt is safer for future-proofing.
-    const recvUsB  = BigInt(Date.now()) * 1000n;
-    const sendUsB  = BigInt(pkt.sendTsUs || "0");
-    const seq      = parseInt(pkt.seq || "0", 10);
+    // proto3 int64 fields arrive as lowerCamelCase via proto3 JSON mapping.
+    // send_ts_us → sendTsUs. k6 gRPC returns int64 as a decimal string.
+    const recvUs  = Number(BigInt(Date.now()) * 1000n);
+    const rawSendTs = pkt.sendTsUs;
+    const seq     = parseInt(pkt.seq || "0", 10);
 
-    const latMs = Number(recvUsB - sendUsB) / 1000;
+    // Guard: skip latency measurement for packets with no server timestamp.
+    // Using || "0" fallback would produce latMs ≈ Date.now() (billions of ms)
+    // which poisons every Trend metric and collapses MOS to 1.0.
+    if (!rawSendTs || rawSendTs === "0" || rawSendTs === 0) {
+      cntNoTs.add(1);
+      pktsRecvd++;
+      if (seqLast >= 0 && seq > seqLast + 1) pktsDropped += seq - seqLast - 1;
+      seqLast = seq;
+      return;
+    }
+    const sendUs  = Number(BigInt(rawSendTs));
+    const latMs   = (recvUs - sendUs) / 1000;
+
+    // Time-to-first-packet: measures WS→Bridge→gRPC full-stack readiness.
+    // startTs is set just before stream.write() so it captures only network
+    // + sender delay, not VU setup overhead.
+    if (!firstPktSeen) {
+      firstPktSeen = true;
+      firstPktMs.add(Date.now() - startTs);
+    }
+
+    // Sanity-cap: if latency is negative (clock skew) or implausibly large
+    // (>60 s means something is wrong), skip it to avoid poisoning the Trend.
+    if (latMs < 0 || latMs > 60_000) {
+      cntNoTs.add(1);
+      return;
+    }
+
     latencies.push(latMs);
     pktsRecvd++;
     pktLatency.add(latMs);
@@ -275,11 +308,13 @@ export function receiveAudio() {
     if (seqLast >= 0 && seq > seqLast + 1) pktsDropped += seq - seqLast - 1;
     seqLast = seq;
 
-    if (prevRecvUs !== null) {
-      jitterSum += Math.abs(Number(recvUsB - prevRecvUs) - Number(sendUsB - prevSendUs));
+    // RFC 3550 §A.8 smoothed jitter: J += (|D| − J) / 16
+    const transit = recvUs - sendUs;
+    if (prevTransit !== null) {
+      const d = Math.abs(transit - prevTransit);
+      jitter += (d - jitter) / 16;
     }
-    prevRecvUs = recvUsB;
-    prevSendUs = sendUsB;
+    prevTransit = transit;
   });
 
   stream.on("end", () => {
@@ -287,6 +322,7 @@ export function receiveAudio() {
       console.error(`[${phase}][${sid}] stream ended with 0 packets`);
       sessOk.add(0);
       closeGrpc();
+      streamEnded = true;
       return;
     }
 
@@ -297,8 +333,10 @@ export function receiveAudio() {
     const p50        = percentile(sorted, 50);
     const p95        = percentile(sorted, 95);
     const p99        = percentile(sorted, 99);
-    const jitterMs   = pktsRecvd > 1 ? jitterSum / (pktsRecvd - 1) / 1000 : 0;
-    const mos        = eModelMOS(latMean, dropFrac);
+    // RFC 3550 smoothed jitter is in µs; convert to ms.
+    const jitterMs   = jitter / 1000;
+    // Use p95 + jitter for MOS — better represents worst-case QoE than mean alone.
+    const mos        = eModelMOS(p95 + jitterMs, dropFrac);
 
     cntExpected.add(pktsExpect);
     cntReceived.add(pktsRecvd);
@@ -313,12 +351,16 @@ export function receiveAudio() {
     sessMOS.add(mos);
     sessOk.add(1);
 
-    console.log(
-      `[${phase}][${sid}] pkts=${pktsRecvd}  drop=${(dropFrac*100).toFixed(2)}%` +
-      `  lat_mean=${latMean.toFixed(1)}ms  lat_p95=${p95.toFixed(1)}ms` +
-      `  jitter=${jitterMs.toFixed(1)}ms  buf_delay=${(p95-p50).toFixed(1)}ms` +
-      `  MOS=${mos.toFixed(2)}`
-    );
+    // Log always for baseline (reference), only when DEBUG=1 during load
+    // to avoid console overhead at 500+ VUs.
+    if (phase === "baseline" || DEBUG) {
+      console.log(
+        `[${phase}][${sid}] pkts=${pktsRecvd}  drop=${(dropFrac*100).toFixed(2)}%` +
+        `  lat_mean=${latMean.toFixed(1)}ms  lat_p95=${p95.toFixed(1)}ms` +
+        `  jitter=${jitterMs.toFixed(1)}ms  buf_delay=${(p95-p50).toFixed(1)}ms` +
+        `  MOS=${mos.toFixed(2)}`
+      );
+    }
 
     closeGrpc();
     streamEnded = true;
@@ -331,19 +373,21 @@ export function receiveAudio() {
     streamEnded = true;
   });
 
+  // startTs is captured here so fwd_first_pkt_ms reflects only the time from
+  // registration until first packet arrives (i.e. includes sender start delay
+  // SENDER_START_S, but not VU init overhead).
+  startTs = Date.now();
   stream.write({ session_id: sid, wait_s: WAIT_S });
   // Half-close the client side — correct for server-streaming RPCs.
-  // Without this, k6's bidirectional Stream may not flush END_STREAM to the server.
   stream.end();
 
   // Pump the k6 event loop in short increments so that gRPC "data" callbacks
   // fire as packets arrive (real-time), not all batched after a long sleep().
-  // A single sleep(SESSION_LIFE_S) queues all callbacks and delivers them at once,
-  // making Date.now() in the handler useless for latency measurement.
   const deadline = Date.now() + SESSION_LIFE_S * 1000;
   while (!streamEnded && Date.now() < deadline) {
     sleep(0.1);
   }
+  closeGrpc(); // safety-net: close if deadline hit before stream ended
 }
 
 // ─── Scenario: sendAudio ──────────────────────────────────────────────────────
@@ -387,5 +431,7 @@ export function sendAudio() {
     socket.on("close", ()    => console.log(`[${phase}][${sid}] WS closed`));
   });
 
-  check(res, { "WS connected (101)": (r) => r && r.status === 101 });
+  const ok = res && res.status === 101;
+  wsOk.add(ok ? 1 : 0);
+  check(res, { "WS connected (101)": () => ok });
 }
