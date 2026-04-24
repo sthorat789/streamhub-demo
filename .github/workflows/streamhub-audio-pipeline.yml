@@ -37,7 +37,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/streamhub
+  IMAGE_NAME: sthorat789/streamhub
 
 # ─── Job 1: Unit tests ────────────────────────────────────────────────────────
 jobs:
