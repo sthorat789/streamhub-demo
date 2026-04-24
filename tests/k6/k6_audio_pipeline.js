@@ -302,6 +302,18 @@ export function receiveAudio() {
   const deadline = Date.now() + SESSION_LIFE_S * 1000;
   while (!streamEnded && Date.now() < deadline) { sleep(0.05); }
 
+  // Fetch exact server-side packet counts before closing the client.
+  let stats = null;
+  try {
+    stats = grpcClient.invoke("audioforward.AudioForwardService/GetSessionStats", {
+      session_id: sid,
+    }).message;
+  } catch (err) {
+    if (DEBUG && exec.vu.idInTest <= 3) {
+      console.log(`[${sid}] GetSessionStats failed: ${err.message || JSON.stringify(err)}`);
+    }
+  }
+
   // Close then drain buffered async callbacks until packet count stabilizes.
   closeGrpc();
   let stableTicks = 0;
@@ -317,10 +329,17 @@ export function receiveAudio() {
     }
   }
 
-  const pktsExpect = pktsDropped + pktsRecvd;
-  const dropFrac   = pktsExpect > 0 ? pktsDropped / pktsExpect : 0;
-  const sessPassed = pktsRecvd === EXPECTED_PKTS && pktsDropped === 0 && pktsCorrupt === 0;
+  const statsRecv = stats ? Number(stats.packetsReceived || 0) : pktsRecvd;
+  const statsDrop = stats ? Number(stats.packetsDropped || 0) : pktsDropped;
+  const pktsExpect = statsRecv + statsDrop;
+  const dropFrac   = pktsExpect > 0 ? statsDrop / pktsExpect : 0;
+  const sessPassed = statsRecv === EXPECTED_PKTS && statsDrop === 0 && pktsCorrupt === 0;
   sessOk.add(sessPassed ? 1 : 0);
+
+  cntExpected.add(pktsExpect);
+  cntReceived.add(statsRecv);
+  cntDropped.add(statsDrop);
+  sessDropPct.add(dropFrac * 100);
 
   if (pktsRecvd > 0) {
     const jitterMs   = jitter / 1000;
@@ -330,23 +349,19 @@ export function receiveAudio() {
     const lateMean  = lateSlice.length ? mean(lateSlice) : 0;
     const drift     = lateMean - earlyMean;
 
-    cntExpected.add(pktsExpect);
-    cntReceived.add(pktsRecvd);
-    cntDropped.add(pktsDropped);
-    sessDropPct.add(dropFrac * 100);
     sessJitter.add(jitterMs);
     sessLatDrift.add(drift);
 
     if (DEBUG && exec.vu.idInTest <= 3) {
       const hint = drift > 20 ? "DELAY" : dropFrac > 0.01 ? "DROP/CORRUPT" : "OK";
       console.log(
-        `[${sid}] pkts=${pktsRecvd}/${EXPECTED_PKTS}  drop=${(dropFrac*100).toFixed(2)}%` +
+	        `[${sid}] pkts=${statsRecv}/${EXPECTED_PKTS}  drop=${(dropFrac*100).toFixed(2)}%` +
         `  corrupt=${pktsCorrupt}  jitter=${jitterMs.toFixed(1)}ms` +
         `  drift=${drift.toFixed(1)}ms  ok=${sessPassed}  [${hint}]`
       );
     }
   } else if (DEBUG && exec.vu.idInTest <= 3) {
-    console.log(`[${sid}] pkts=0/${EXPECTED_PKTS}  ok=${sessPassed}  [NO_DATA]`);
+	    console.log(`[${sid}] pkts=${statsRecv}/${EXPECTED_PKTS}  ok=${sessPassed}  [NO_DATA]`);
   }
 }
 

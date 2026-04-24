@@ -29,6 +29,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"flag"
 	"io"
@@ -56,9 +57,15 @@ type session struct {
 	ready chan struct{}        // closed exactly once when PushAudio starts
 }
 
+type sessionStats struct {
+	packetsReceived uint64
+	packetsDropped  uint64
+}
+
 var (
-	mu       sync.Mutex
-	sessions = make(map[string]*session, 512)
+	mu        sync.Mutex
+	sessions  = make(map[string]*session, 512)
+	completed = make(map[string]sessionStats, 512)
 )
 
 func getOrCreate(id string) *session {
@@ -79,6 +86,19 @@ func remove(id string) {
 	mu.Lock()
 	delete(sessions, id)
 	mu.Unlock()
+}
+
+func storeStats(id string, received, dropped uint64) {
+	mu.Lock()
+	completed[id] = sessionStats{packetsReceived: received, packetsDropped: dropped}
+	mu.Unlock()
+}
+
+func getStats(id string) (sessionStats, bool) {
+	mu.Lock()
+	stats, ok := completed[id]
+	mu.Unlock()
+	return stats, ok
 }
 
 func markReady(s *session) {
@@ -221,12 +241,31 @@ func (b *bridgeServer) PushAudio(stream pb.AudioForwardService_PushAudioServer) 
 		remove(sid)
 	}
 	log.Printf("[%s] PushAudio closed  recv=%d dropped=%d", shortID(sid), pktsRecv, pktsDropped)
+	if sid != "" {
+		storeStats(sid, pktsRecv, pktsDropped)
+	}
 
 	return stream.SendAndClose(&pb.PushResult{
 		SessionId:       sid,
 		PacketsReceived: pktsRecv,
 		PacketsDropped:  pktsDropped,
 	})
+}
+
+func (b *bridgeServer) GetSessionStats(ctx context.Context, req *pb.SessionStatsRequest) (*pb.SessionStats, error) {
+	sid := req.GetSessionId()
+	if sid == "" {
+		return nil, status.Error(codes.InvalidArgument, "session_id is required")
+	}
+	stats, ok := getStats(sid)
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "session %q stats not found", sid)
+	}
+	return &pb.SessionStats{
+		SessionId:       sid,
+		PacketsReceived: stats.packetsReceived,
+		PacketsDropped:  stats.packetsDropped,
+	}, nil
 }
 
 // ReceiveAudio — k6 receiver calls this to get PCM packets out of the bridge.

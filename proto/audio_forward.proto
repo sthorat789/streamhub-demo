@@ -26,6 +26,10 @@ service AudioForwardService {
   // k6 receiver calls this on Bridge to pull PCM packets for a session.
   // Bridge streams every AudioPacket until the PushAudio stream closes.
   rpc ReceiveAudio (ReceiveRequest)     returns (stream AudioPacket);
+
+  // k6 receiver calls this after ReceiveAudio completes to fetch exact
+  // server-side packet counts for the session.
+  rpc GetSessionStats (SessionStatsRequest) returns (SessionStats);
 }
 
 // ─── Messages ─────────────────────────────────────────────────────────────────
@@ -44,6 +48,16 @@ message PushResult {
   string session_id        = 1;  // echo of session_id from packets
   uint64 packets_received  = 2;  // total packets accepted by Bridge
   uint64 packets_dropped   = 3;  // dropped due to full channel buffer
+}
+
+message SessionStatsRequest {
+  string session_id = 1;
+}
+
+message SessionStats {
+  string session_id       = 1;
+  uint64 packets_received = 2;
+  uint64 packets_dropped  = 3;
 }
 
 // One chunk of raw 16-bit signed PCM audio.
