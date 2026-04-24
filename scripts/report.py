@@ -48,9 +48,12 @@ def parse_k6_summary(path: str) -> dict:
 
 
 def k6_all_thresholds_pass(summary: dict) -> bool:
+    # k6 < v0.43: threshold value is {"ok": bool, ...}
+    # k6 >= v0.43: threshold value is a plain bool
     for m in summary.get("metrics", {}).values():
         for thr in m.get("thresholds", {}).values():
-            if not thr.get("ok", True):
+            ok = thr.get("ok", True) if isinstance(thr, dict) else bool(thr)
+            if not ok:
                 return False
     return True
 
