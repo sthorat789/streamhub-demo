@@ -142,21 +142,10 @@ const GRACEFUL_S = SESSION_LIFE_S + "s";
 // ─── k6 options ────────────────────────────────────────────────────────────────
 export const options = {
   scenarios: {
-
-    // ── Load — ramping-vus ────────────────────────────────────────────────────
-    load_receiver: {
-      executor:         "ramping-vus",
-      exec:             "receiveAudio",
-      startTime:        "0s",
-      stages:           LOAD_STAGES,
-      gracefulRampDown: GRACEFUL_S,
-      gracefulStop:     GRACEFUL_S,
-      tags:             { phase: "load" },
-    },
     load_sender: {
       executor:         "ramping-vus",
       exec:             "sendAudio",
-      startTime:        SENDER_START_S + "s",
+      startTime:        "0s",
       stages:           LOAD_STAGES,
       gracefulRampDown: GRACEFUL_S,
       gracefulStop:     GRACEFUL_S,
@@ -165,14 +154,8 @@ export const options = {
   },
 
   thresholds: {
-    fwd_sess_ok:       ["rate>0.95"],  // ≥95% sessions received all packets
     fwd_ws_ok:         ["rate>0.99"],  // ≥99% WS connections succeed
     fwd_ws_conn_ms:    ["p(95)<3000"],// WS handshake p95 < 3 s
-    fwd_sess_drop_pct: ["avg<1"],      // average session drop rate < 1%
-    fwd_bridge_latency_ms: ["p(95)<50"], // StreamHub→Bridge packet latency
-    fwd_sess_jitter_ms:["avg<50"],    // mean per-session IPDV < 50 ms
-    // fwd_sess_lat_drift_ms: informational — positive drift = StreamHub buffering/adding
-    // delay; near-zero drift + drops = StreamHub corrupting/dropping packets.
   },
 };
 
@@ -197,6 +180,21 @@ const cntCorrupt    = new Counter("fwd_pkts_corrupt");
 const wsConnMs      = new Trend("fwd_ws_conn_ms",        true);
 const sessOk        = new Rate("fwd_sess_ok");
 const wsOk          = new Rate("fwd_ws_ok");
+
+function stampBinaryFrame(pcmBuf) {
+  const pcm = new Uint8Array(pcmBuf);
+  const frame = new Uint8Array(12 + pcm.length);
+  frame[0] = 75; // K
+  frame[1] = 54; // 6
+  frame[2] = 84; // T
+  frame[3] = 83; // S
+  let tsUs = BigInt(Date.now()) * 1000n;
+  for (let i = 0; i < 8; i++) {
+    frame[4 + i] = Number((tsUs >> BigInt(8 * i)) & 0xffn);
+  }
+  frame.set(pcm, 12);
+  return frame.buffer;
+}
 
 // ─── Session ID ────────────────────────────────────────────────────────────────
 // Uses exec.scenario.iterationInTest — a per-scenario global counter that
@@ -396,7 +394,7 @@ export function sendAudio() {
           return;
         }
         const end = Math.min(offset + CHUNK_BYTES, dataEnd);
-        socket.sendBinary(wavBuffer.slice(offset, end));
+        socket.sendBinary(stampBinaryFrame(wavBuffer.slice(offset, end)));
         offset = end;
       }, CHUNK_MS);
     });

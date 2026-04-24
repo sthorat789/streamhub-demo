@@ -3,6 +3,7 @@
 
 Inputs:
   --k6-summary FILE    k6 summary JSON (from k6 run --summary-export)
+    --e2e-summary FILE   native Go probe JSON output
   --quality FILE       quality_check.py JSON output (--json flag)
   --out FILE           output HTML path  (default: report.html alongside inputs)
 
@@ -23,7 +24,7 @@ from datetime import datetime, timezone
 # ─── k6 summary parsing ────────────────────────────────────────────────────────
 
 METRIC_LABELS = {
-    "fwd_pkt_latency_ms":    "Packet latency",
+    "fwd_bridge_latency_ms": "Bridge latency",
     "fwd_sess_lat_mean_ms":  "Session lat mean",
     "fwd_sess_lat_p50_ms":   "Session lat p50",
     "fwd_sess_lat_p95_ms":   "Session lat p95",
@@ -41,6 +42,13 @@ METRIC_LABELS = {
 
 
 def parse_k6_summary(path: str) -> dict:
+    if not path or not os.path.isfile(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+def parse_e2e_summary(path: str) -> dict:
     if not path or not os.path.isfile(path):
         return {}
     with open(path) as f:
@@ -135,7 +143,7 @@ def quality_all_pass(results: list[dict]) -> bool:
 def latency_chart_data(summary: dict) -> str:
     labels, avg_vals, p95_vals = [], [], []
     trend_keys = [
-        ("fwd_pkt_latency_ms",    "Pkt latency"),
+        ("fwd_bridge_latency_ms", "Bridge latency"),
         ("fwd_sess_lat_p50_ms",   "Sess p50"),
         ("fwd_sess_lat_p95_ms",   "Sess p95"),
         ("fwd_sess_jitter_ms",    "Jitter"),
@@ -226,6 +234,12 @@ HTML_TEMPLATE = """\
     <div class="section-header">k6 Performance Metrics</div>
     {k6_table}
   </div>
+
+    <!-- Native e2e metrics -->
+    <div class="section">
+        <div class="section-header">Native End-To-End Metrics</div>
+        {e2e_table}
+    </div>
 
   <!-- Latency chart -->
   {chart_section}
@@ -342,21 +356,43 @@ def build_chart_section(chart_data: str) -> str:
 """
 
 
+def build_e2e_table(summary: dict) -> str:
+    if not summary:
+        return "<p style='padding:20px;color:#aaa'>No native e2e summary found.</p>"
+    rows = [
+        ("E2E latency p95", f"{summary.get('e2e_latency_p95_ms', 0):.2f} ms", "✓ p95<500ms" if summary.get('thresholds', {}).get('e2e_latency_p95_lt_500ms') else "✗ p95<500ms"),
+        ("Session success rate", f"{summary.get('sess_ok_rate', 0)*100:.1f}%", "✓ rate>95%" if summary.get('thresholds', {}).get('sess_ok_rate_gt_095') else "✗ rate>95%"),
+        ("Avg drop %", f"{summary.get('sess_drop_pct_avg', 0):.2f}%", "✓ avg<1%" if summary.get('thresholds', {}).get('sess_drop_pct_avg_lt_1') else "✗ avg<1%"),
+        ("Expected packets/session", str(int(summary.get('expected_packets', 0))), "—"),
+        ("Sessions probed", str(int(summary.get('session_count', 0))), "—"),
+    ]
+    hdr = "<thead><tr><th>Metric</th><th>Value</th><th>Threshold</th></tr></thead>"
+    body = "<tbody>"
+    for label, value, threshold in rows:
+        cls = "ok" if threshold.startswith("✓") or threshold == "—" else "fail"
+        body += f"<tr><td>{label}</td><td>{value}</td><td class='{cls} mono'>{threshold}</td></tr>"
+    body += "</tbody>"
+    return f"<table>{hdr}{body}</table>"
+
+
 # ─── main ──────────────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser(description="Generate HTML pipeline report")
     ap.add_argument("--k6-summary", metavar="FILE", help="k6 --summary-export JSON")
+    ap.add_argument("--e2e-summary", metavar="FILE", help="native e2e probe JSON")
     ap.add_argument("--quality",    metavar="FILE", help="quality_check.py --json output")
     ap.add_argument("--out",        metavar="FILE", default="report.html", help="Output HTML")
     args = ap.parse_args()
 
     summary  = parse_k6_summary(args.k6_summary)
+    e2e      = parse_e2e_summary(args.e2e_summary)
     quality  = parse_quality(args.quality)
 
     k6_pass  = k6_all_thresholds_pass(summary) if summary else True
+    e2e_pass = all(e2e.get("thresholds", {}).values()) if e2e else True
     q_pass   = quality_all_pass(quality)        if quality else True
-    overall  = k6_pass and q_pass
+    overall  = k6_pass and e2e_pass and q_pass
 
     ts       = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     rows     = k6_rows(summary)
@@ -372,7 +408,7 @@ def main():
     # MOS from k6 summary
     mos_avg = summary.get("metrics", {}).get("fwd_sess_mos", {}).get("values", {}).get("avg")
     # Latency p95 from k6 summary
-    lat_p95 = summary.get("metrics", {}).get("fwd_pkt_latency_ms", {}).get("values", {}).get("p(95)")
+    lat_p95 = e2e.get("e2e_latency_p95_ms") or summary.get("metrics", {}).get("fwd_bridge_latency_ms", {}).get("values", {}).get("p(95)")
 
     cards = "".join([
         stat_card("PASS" if overall else "FAIL", "Overall result"),
@@ -389,6 +425,7 @@ def main():
         overall_label="ALL PASS" if overall else "FAILED",
         summary_cards=cards,
         k6_table=build_k6_table(rows),
+        e2e_table=build_e2e_table(e2e),
         chart_section=build_chart_section(cdata),
         quality_table=build_quality_table(quality),
         chart_data=cdata,
@@ -402,6 +439,7 @@ def main():
     print(f"Report written → {out}")
     print(f"  Overall: {'PASS' if overall else 'FAIL'}  "
           f"k6={'PASS' if k6_pass else 'FAIL'}  "
+            f"e2e={'PASS' if e2e_pass else 'FAIL'}  "
           f"quality={'PASS' if q_pass else 'FAIL'}")
 
 

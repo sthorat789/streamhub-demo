@@ -76,4 +76,9 @@ message AudioPacket {
   // received from StreamHub over PushAudio.
   // Accurate StreamHub→Bridge latency = recv_ts_us - send_ts_us.
   int64  recv_ts_us  = 7;
+  // Original k6 sender wall-clock time in microseconds (UTC epoch) captured
+  // immediately before socket.sendBinary().
+  // Accurate one-way end-to-end latency to a native receiver is
+  // receiver_arrival_ts_us - client_send_ts_us.
+  int64  client_send_ts_us = 8;
 }

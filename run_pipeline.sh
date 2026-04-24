@@ -152,8 +152,9 @@ if [[ "$K6_ONLY" == false ]]; then
   fi
   go mod tidy -e
   go build -o bin/bridge     ./cmd/bridge
+  go build -o bin/e2eprobe   ./cmd/e2eprobe
   go build -o bin/streamhub  ./cmd/streamhub
-  echo "    Built: bin/bridge  bin/streamhub"
+  echo "    Built: bin/bridge  bin/e2eprobe  bin/streamhub"
   cd "$SCRIPT_DIR"
 fi
 
@@ -181,6 +182,18 @@ fi
 # ─── k6 ────────────────────────────────────────────────────────────────────────
 if [[ "$NO_K6" == false ]]; then
   echo ""
+  echo "==> Starting native e2e latency probe..."
+  "$GO_DIR/bin/e2eprobe" \
+    --bridge-addr="127.0.0.1:$BRIDGE_PORT" \
+    --wait-s="$WAIT_S" \
+    --session-count="$MAX_VUS" \
+    --audio-file="$SCRIPT_DIR/$AUDIO_FILE" \
+    --chunk-ms="$CHUNK_MS" \
+    --out "$RESULTS_DIR/e2e_latency.json" \
+    > "$RESULTS_DIR/e2eprobe.log" 2>&1 &
+  E2E_PROBE_PID=$!
+  PIDS+=($E2E_PROBE_PID)
+
   echo "==> Running k6  max_vus=$MAX_VUS  ramp=$RAMP_DURATION  stable=$STABLE_DURATION  chunk_ms=$CHUNK_MS  audio=$AUDIO_FILE"
   echo "──────────────────────────────────────────────────────────────────"
   cd "$SCRIPT_DIR"
@@ -198,6 +211,12 @@ if [[ "$NO_K6" == false ]]; then
     --env STABLE_DURATION="$STABLE_DURATION" \
     --env WAIT_S="$WAIT_S" \
     tests/k6/k6_audio_pipeline.js
+  echo ""
+
+  E2E_PROBE_STATUS=0
+  wait "$E2E_PROBE_PID" || E2E_PROBE_STATUS=$?
+  echo "==> E2E probe log"
+  cat "$RESULTS_DIR/e2eprobe.log" || true
   echo ""
 
   # ── Quality check ───────────────────────────────────────────────────────────
@@ -234,7 +253,12 @@ if [[ "$NO_K6" == false ]]; then
   "$PYTHON" scripts/report.py \
     $K6_ARG \
     $QUALITY_ARG \
+    --e2e-summary "$RESULTS_DIR/e2e_latency.json" \
     --out "$RESULTS_DIR/report.html"
+
+  if [[ "$E2E_PROBE_STATUS" -ne 0 ]]; then
+    exit "$E2E_PROBE_STATUS"
+  fi
 
 else
   echo ""

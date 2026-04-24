@@ -27,6 +27,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"log"
@@ -54,6 +55,8 @@ type metadata struct {
 	Channels   uint32 `json:"channels"`
 	ChunkMS    uint32 `json:"chunk_ms"`
 }
+
+var clientTsMagic = [4]byte{'K', '6', 'T', 'S'}
 
 // ─── Per-connection handler ────────────────────────────────────────────────────
 // Each WS connection gets its own goroutine, its own gRPC connection, and its
@@ -119,13 +122,24 @@ func handleWS(bridgeAddr string, w http.ResponseWriter, r *http.Request) {
 			continue // skip non-binary (e.g. ping frames)
 		}
 
+		clientSendTsUs := int64(0)
+		if len(data) >= 12 &&
+			data[0] == clientTsMagic[0] &&
+			data[1] == clientTsMagic[1] &&
+			data[2] == clientTsMagic[2] &&
+			data[3] == clientTsMagic[3] {
+			clientSendTsUs = int64(binary.LittleEndian.Uint64(data[4:12]))
+			data = data[12:]
+		}
+
 		pkt := &pb.AudioPacket{
-			Seq:        seq,
-			SendTsUs:   time.Now().UnixMicro(),
-			SessionId:  sid,
-			SampleRate: meta.SampleRate,
-			Channels:   meta.Channels,
-			Payload:    append([]byte(nil), data...), // copy — WS reuses buf
+			Seq:            seq,
+			SendTsUs:       time.Now().UnixMicro(),
+			SessionId:      sid,
+			SampleRate:     meta.SampleRate,
+			Channels:       meta.Channels,
+			Payload:        append([]byte(nil), data...), // copy — WS reuses buf
+			ClientSendTsUs: clientSendTsUs,
 		}
 		seq++
 
