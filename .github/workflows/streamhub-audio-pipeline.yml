@@ -121,7 +121,6 @@ jobs:
     needs: build-docker
     permissions:
       contents: read
-      packages: read
 
     steps:
       - uses: actions/checkout@v4
@@ -186,22 +185,28 @@ jobs:
           echo "BRIDGE_PID=$!" >> "$GITHUB_ENV"
           echo "Bridge started (PID $!)"
 
-      # ── Pull & start StreamHub Docker (--network=host so it reaches Bridge) ─
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      # ── Build StreamHub image locally using GHA layer cache ─────────────────
+      # Avoids pulling from GHCR (private package auth / network timeout issues).
+      # The build-docker job already populated the GHA cache, so this is fast.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build StreamHub image (local, no push)
+        uses: docker/build-push-action@v5
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          context: .
+          file: Dockerfile
+          push: false
+          load: true
+          tags: streamhub:ci
+          cache-from: type=gha
 
       - name: Start StreamHub Docker container
         run: |
-          IMAGE="${{ needs.build-docker.outputs.image }}"
-          docker pull "$IMAGE"
           docker run -d \
             --name streamhub \
             --network=host \
-            "$IMAGE" \
+            streamhub:ci \
             --ws-port=8765 \
             --bridge-addr=127.0.0.1:50052
           echo "StreamHub container started"
