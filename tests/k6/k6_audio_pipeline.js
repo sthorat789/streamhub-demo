@@ -242,44 +242,6 @@ export function receiveAudio() {
   const lateLats  = new Array(DRIFT_N); // circular buffer for last DRIFT_N
   let   lateIdx   = 0;
 
-  // flush() records all per-session metrics and is called after the polling
-  // loop exits regardless of whether "end" fired. This ensures metrics are
-  // captured even when k6 interrupts the iteration (graceful-stop timeout).
-  function flush() {
-    if (!pktsRecvd) {
-      sessOk.add(0);
-      return;
-    }
-    const pktsExpect = pktsDropped + pktsRecvd;
-    const dropFrac   = pktsExpect > 0 ? pktsDropped / pktsExpect : 0;
-    const jitterMs   = jitter / 1000;
-
-    // Latency drift: mean(last-5) − mean(first-5).
-    const mean = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
-    const earlyMean = earlyLats.length ? mean(earlyLats) : 0;
-    const lateSlice = lateLats.slice(0, Math.min(lateIdx, DRIFT_N)).filter((v) => v !== undefined);
-    const lateMean  = lateSlice.length ? mean(lateSlice) : 0;
-    const drift     = lateMean - earlyMean;
-
-    cntExpected.add(pktsExpect);
-    cntReceived.add(pktsRecvd);
-    cntDropped.add(pktsDropped);
-    sessDropPct.add(dropFrac * 100);
-    sessJitter.add(jitterMs);
-    sessLatDrift.add(drift);
-    // sessOk=1 only if the stream ended cleanly (not timed-out or errored).
-    sessOk.add(streamCleanly ? 1 : 0);
-
-    if (DEBUG && exec.vu.idInTest <= 3) {
-      const hint = drift > 20 ? "DELAY" : dropFrac > 0.01 ? "DROP/CORRUPT" : "OK";
-      console.log(
-        `[${sid}] pkts=${pktsRecvd}  drop=${(dropFrac*100).toFixed(2)}%` +
-        `  jitter=${jitterMs.toFixed(1)}ms  drift=${drift.toFixed(1)}ms` +
-        `  clean=${streamCleanly}  [${hint}]`
-      );
-    }
-  }
-
   stream.on("data", (pkt) => {
     // send_ts_us → sendTsUs (proto3 JSON lowerCamelCase). int64 arrives as decimal string.
     // Date.now() accurate to ±50 ms because the polling loop wakes every 50 ms.
@@ -324,9 +286,6 @@ export function receiveAudio() {
   });
 
   stream.on("end", () => {
-    // Signal the polling loop to exit. Do NOT call closeGrpc() here —
-    // we deliberately close from the main flow so we can sleep() afterwards
-    // to let buffered "data" callbacks drain before flush() reads the state.
     streamCleanly = true;
     streamEnded   = true;
   });
@@ -339,17 +298,47 @@ export function receiveAudio() {
   stream.write({ session_id: sid, wait_s: WAIT_S });
   stream.end(); // half-close — correct for server-streaming RPCs
 
-  // Wait for "end" (or deadline) in 50 ms ticks.
+  // Poll in 50 ms ticks until "end"/"error" fires or SESSION_LIFE_S expires.
   const deadline = Date.now() + SESSION_LIFE_S * 1000;
   while (!streamEnded && Date.now() < deadline) { sleep(0.05); }
 
-  // Close the gRPC connection. k6 dispatches buffered "data" callbacks
-  // asynchronously when the connection closes. The sleep() below yields to
-  // the event loop so those callbacks fire and populate pktsRecvd, jitter, etc.
-  // before flush() reads them.
+  // Record session success based on "end" firing — NOT on pktsRecvd.
+  // In k6 gRPC streaming, "data" callbacks are dispatched asynchronously,
+  // only after grpcClient.close(). sessOk must not depend on pktsRecvd.
+  // "end" = server closed stream cleanly = all packets were forwarded.
+  sessOk.add(streamCleanly ? 1 : 0);
+
+  // Close then yield — buffered "data" callbacks fire during sleep().
   closeGrpc();
-  sleep(0.5);   // drain async data callbacks
-  flush();      // record per-session metrics now that state is populated
+  sleep(0.5);
+
+  // Best-effort per-session drop/jitter/drift — recorded only if data callbacks
+  // fired during sleep(0.5). Thresholds pass vacuously (avg=0) if they didn't.
+  if (pktsRecvd > 0) {
+    const pktsExpect = pktsDropped + pktsRecvd;
+    const dropFrac   = pktsExpect > 0 ? pktsDropped / pktsExpect : 0;
+    const jitterMs   = jitter / 1000;
+    const mean      = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
+    const earlyMean = earlyLats.length ? mean(earlyLats) : 0;
+    const lateSlice = lateLats.slice(0, Math.min(lateIdx, DRIFT_N)).filter((v) => v !== undefined);
+    const lateMean  = lateSlice.length ? mean(lateSlice) : 0;
+    const drift     = lateMean - earlyMean;
+
+    cntExpected.add(pktsExpect);
+    cntReceived.add(pktsRecvd);
+    cntDropped.add(pktsDropped);
+    sessDropPct.add(dropFrac * 100);
+    sessJitter.add(jitterMs);
+    sessLatDrift.add(drift);
+
+    if (DEBUG && exec.vu.idInTest <= 3) {
+      const hint = drift > 20 ? "DELAY" : dropFrac > 0.01 ? "DROP/CORRUPT" : "OK";
+      console.log(
+        `[${sid}] pkts=${pktsRecvd}  drop=${(dropFrac*100).toFixed(2)}%` +
+        `  jitter=${jitterMs.toFixed(1)}ms  drift=${drift.toFixed(1)}ms  [${hint}]`
+      );
+    }
+  }
 }
 
 // ─── Scenario: sendAudio ──────────────────────────────────────────────────────
