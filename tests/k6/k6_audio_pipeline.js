@@ -1,15 +1,12 @@
 /**
- * k6_audio_pipeline.js — Two-phase StreamHub audio pipeline load test
+ * k6_audio_pipeline.js — StreamHub audio pipeline load test
  *
  * ── Topology ──────────────────────────────────────────────────────────────────
  *   k6 sender   ──(WebSocket binary)──────────► StreamHub  :8765
  *   StreamHub   ──(gRPC PushAudio)────────────► Bridge     :50052
  *   k6 receiver ◄──(gRPC ReceiveAudio)───────── Bridge     :50052
  *
- * ── Test phases ───────────────────────────────────────────────────────────────
- *   Phase 1 — Baseline   1 VU · 1 iteration · establishes reference values
- *   Phase 2 — Load       ramping-vus:
- *               Shape (controlled by MAX_VUS, default 500):
+ * ── Load shape (controlled by MAX_VUS, default 500) ──────────────────────────
  *               1 min  ramp  0      → 20% of MAX_VUS
  *               1 min  ramp  20%    → 50% of MAX_VUS
  *               1 min  ramp  50%    → MAX_VUS (peak)
@@ -61,10 +58,11 @@ const RAMP_DURATION    = __ENV.RAMP_DURATION   || "1m";
 const STABLE_DURATION  = __ENV.STABLE_DURATION || "3m";
 const DEBUG            = __ENV.DEBUG === "1";
 
-// ─── gRPC proto path — used per-VU client inside receiveAudio() ───────────────
-// k6 resolves grpcClient.load() paths relative to the script file (tests/k6/),
-// so ["../../proto"] points to proto/ at the repo root.
-const GRPC_PROTO_PATH = ["../../proto"];
+// ─── gRPC client — init context (load() must run here; each VU gets its own copy) ─
+// k6 global variables are per-VU: each VU initialises its own grpcClient.
+// connect()/close() are called per-iteration inside receiveAudio().
+const grpcClient = new Client();
+grpcClient.load(["../../proto"], "audio_forward.proto");
 
 // ─── WAV loading & parsing — init context ──────────────────────────────────────
 const wavBuffer = open(AUDIO_FILE, "b");
@@ -108,11 +106,7 @@ const SENDER_START_S = 5;
 // How long one full audio session lasts end-to-end.
 const SESSION_LIFE_S = Math.ceil(SENDER_START_S + DURATION_S + WAIT_S + 20);
 
-// Phase 1 (baseline) ends SESSION_LIFE_S + 60 s buffer after t=0.
-// Extra gap avoids lingering baseline sockets polluting load-phase metrics.
-const BASELINE_END_S = SESSION_LIFE_S + 60;
-
-// Phase 2 ramp schedule — generated from MAX_VUS.
+// Ramp schedule — generated from MAX_VUS.
 // Shape: ramp to 20% → 50% → 100% (stable 3m) → 50% → 20% → 0.
 // Sender scenario starts SENDER_START_S seconds after receiver, so receiver
 // VUs are always registered before the matching sender VUs connect.
@@ -143,33 +137,11 @@ const GRACEFUL_S = SESSION_LIFE_S + "s";
 export const options = {
   scenarios: {
 
-    // ── Phase 1: Baseline — 1 VU, 1 iteration ─────────────────────────────────
-    baseline_receiver: {
-      executor:    "shared-iterations",
-      vus:         1,
-      iterations:  1,
-      exec:        "receiveAudio",
-      startTime:   "0s",
-      maxDuration: BASELINE_END_S + "s",
-      gracefulStop: GRACEFUL_S,
-      tags:        { phase: "baseline" },
-    },
-    baseline_sender: {
-      executor:    "shared-iterations",
-      vus:         1,
-      iterations:  1,
-      exec:        "sendAudio",
-      startTime:   SENDER_START_S + "s",
-      maxDuration: (BASELINE_END_S - SENDER_START_S) + "s",
-      gracefulStop: GRACEFUL_S,
-      tags:        { phase: "baseline" },
-    },
-
-    // ── Phase 2: Load — ramping-vus ────────────────────────────────────────────
+    // ── Load — ramping-vus ────────────────────────────────────────────────────
     load_receiver: {
       executor:         "ramping-vus",
       exec:             "receiveAudio",
-      startTime:        BASELINE_END_S + "s",
+      startTime:        "0s",
       stages:           LOAD_STAGES,
       gracefulRampDown: GRACEFUL_S,
       gracefulStop:     GRACEFUL_S,
@@ -178,7 +150,7 @@ export const options = {
     load_sender: {
       executor:         "ramping-vus",
       exec:             "sendAudio",
-      startTime:        (BASELINE_END_S + SENDER_START_S) + "s",
+      startTime:        SENDER_START_S + "s",
       stages:           LOAD_STAGES,
       gracefulRampDown: GRACEFUL_S,
       gracefulStop:     GRACEFUL_S,
@@ -223,8 +195,7 @@ const wsOk         = new Rate("fwd_ws_ok");
 // receiver iter N and sender iter N will always share the same session_id,
 // enabling correct pairing on Bridge even at high VU counts.
 function sessionId() {
-  const prefix = exec.scenario.name.startsWith("baseline") ? "bl" : "ld";
-  return `${prefix}-${exec.scenario.iterationInTest}`;
+  return `ld-${exec.scenario.iterationInTest}`;
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -252,18 +223,15 @@ function eModelMOS(latMs, dropFrac) {
 }
 
 // ─── Scenario: receiveAudio ────────────────────────────────────────────────────
-// Used by both baseline_receiver and load_receiver.
+// Used by both load_receiver and load_sender.
 // Connects to Bridge gRPC, calls ReceiveAudio, computes all quality metrics.
 
 export function receiveAudio() {
-  const sid   = sessionId();
-  const phase = exec.scenario.name.startsWith("baseline") ? "baseline" : "load";
+  const sid = sessionId();
 
-  // Per-iteration gRPC client: avoids shared-state reconnect churn and
-  // double-close races at high VU counts. load() is per-client but k6
-  // caches the proto parse, so overhead is a single file-read per VU.
-  const grpcClient = new Client();
-  grpcClient.load(GRPC_PROTO_PATH, "audio_forward.proto");
+  // Per-iteration connect/close: each iteration gets a fresh connection.
+  // grpcClient is a per-VU global (k6 gives each VU its own copy); only
+  // connect()/close() are called here to satisfy k6's init-context rule.
   grpcClient.connect(BRIDGE_GRPC_ADDR, { plaintext: true });
   const stream = new Stream(grpcClient, "audioforward.AudioForwardService/ReceiveAudio");
   let grpcClosed = false;
@@ -333,7 +301,7 @@ export function receiveAudio() {
 
   stream.on("end", () => {
     if (!pktsRecvd) {
-      console.error(`[${phase}][${sid}] stream ended with 0 packets`);
+      console.error(`[load][${sid}] stream ended with 0 packets`);
       sessOk.add(0);
       closeGrpc();
       streamEnded = true;
@@ -359,11 +327,11 @@ export function receiveAudio() {
     sessMOS.add(mos);
     sessOk.add(1);
 
-    // Log baseline always; load phase only for first 3 VUs or when DEBUG=1.
+    // Log only for first 3 VUs or when DEBUG=1.
     // At 500 VUs, logging every session floods CI output with ~500 lines/run.
-    if (phase === "baseline" || (DEBUG && exec.vu.idInTest <= 3)) {
+    if (DEBUG && exec.vu.idInTest <= 3) {
       console.log(
-        `[${phase}][${sid}] pkts=${pktsRecvd}  drop=${(dropFrac*100).toFixed(2)}%` +
+        `[load][${sid}] pkts=${pktsRecvd}  drop=${(dropFrac*100).toFixed(2)}%` +
         `  lat_mean=${latMean.toFixed(1)}ms  lat_p95=${p95.toFixed(1)}ms` +
         `  jitter=${jitterMs.toFixed(1)}ms  MOS=${mos.toFixed(2)}`
       );
@@ -374,7 +342,7 @@ export function receiveAudio() {
   });
 
   stream.on("error", (err) => {
-    console.error(`[${phase}][${sid}] gRPC error: ${err.message || JSON.stringify(err)}`);
+    console.error(`[load][${sid}] gRPC error: ${err.message || JSON.stringify(err)}`);
     sessOk.add(0);
     closeGrpc();
     streamEnded = true;
@@ -398,12 +366,11 @@ export function receiveAudio() {
 }
 
 // ─── Scenario: sendAudio ──────────────────────────────────────────────────────
-// Used by both baseline_sender and load_sender.
+// Used by both load_receiver and load_sender (sendAudio).
 // Connects to StreamHub via WebSocket and streams the reference WAV file.
 
 export function sendAudio() {
   const sid    = sessionId();
-  const phase  = exec.scenario.name.startsWith("baseline") ? "baseline" : "load";
   const tStart = Date.now();
 
   const res = ws.connect(WS_URL, {}, (socket) => {
@@ -434,8 +401,8 @@ export function sendAudio() {
       }, CHUNK_MS);
     });
 
-    socket.on("error", (err) => console.error(`[${phase}][${sid}] WS error: ${err}`));
-    socket.on("close", ()    => console.log(`[${phase}][${sid}] WS closed`));
+    socket.on("error", (err) => console.error(`[load][${sid}] WS error: ${err}`));
+    socket.on("close", ()    => console.log(`[load][${sid}] WS closed`));
   });
 
   const ok = res && res.status === 101;
