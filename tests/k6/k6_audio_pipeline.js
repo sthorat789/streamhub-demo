@@ -61,11 +61,10 @@ const RAMP_DURATION    = __ENV.RAMP_DURATION   || "1m";
 const STABLE_DURATION  = __ENV.STABLE_DURATION || "3m";
 const DEBUG            = __ENV.DEBUG === "1";
 
-// ─── gRPC client — init context ────────────────────────────────────────────────
-const grpcClient = new Client();
-grpcClient.load(["../../proto"], "audio_forward.proto");
-// k6 resolves load() paths relative to the script file (tests/k6/),
-// so ../../proto points to proto/ at the repo root.
+// ─── gRPC proto path — used per-VU client inside receiveAudio() ───────────────
+// k6 resolves grpcClient.load() paths relative to the script file (tests/k6/),
+// so ["../../proto"] points to proto/ at the repo root.
+const GRPC_PROTO_PATH = ["../../proto"];
 
 // ─── WAV loading & parsing — init context ──────────────────────────────────────
 const wavBuffer = open(AUDIO_FILE, "b");
@@ -188,33 +187,33 @@ export const options = {
   },
 
   thresholds: {
-    // Applied across both phases; baseline values inform whether load passes.
-    fwd_sess_ok:        ["rate>0.95"],
-    fwd_ws_ok:          ["rate>0.99"],
-    fwd_ws_conn_ms:     ["p(95)<3000"],
-    fwd_first_pkt_ms:   ["p(95)<" + (SENDER_START_S * 1000 + 3000)],
-    fwd_pkt_latency_ms: ["p(95)<500"],
-    fwd_sess_mos:       ["avg>3.5"],
-    fwd_sess_drop_pct:  ["avg<1"],
+    // Reliable metrics only — these do not depend on per-packet Date.now()
+    // timestamps (which are batch-fired and therefore inaccurate in k6 gRPC).
+    fwd_sess_ok:       ["rate>0.95"],   // sessions that received all packets
+    fwd_ws_ok:         ["rate>0.99"],   // WebSocket connection success
+    fwd_ws_conn_ms:    ["p(95)<3000"],  // WS handshake time
+    fwd_sess_drop_pct: ["avg<1"],       // packet sequence drop %
+    // fwd_pkt_latency_ms, fwd_sess_mos, fwd_first_pkt_ms are collected but
+    // not thresholded — k6 gRPC callbacks batch-fire, making Date.now()
+    // inside them reflect post-burst time, not true packet arrival time.
   },
 };
 
 // ─── Custom metrics ────────────────────────────────────────────────────────────
+// Informational latency metrics (not thresholded — batch-fired, see thresholds note)
 const pktLatency   = new Trend("fwd_pkt_latency_ms",    true);
-const sessDropPct  = new Trend("fwd_sess_drop_pct",     true);
+const firstPktMs   = new Trend("fwd_first_pkt_ms",      true);
 const sessLatMean  = new Trend("fwd_sess_lat_mean_ms",  true);
-const sessLatP50   = new Trend("fwd_sess_lat_p50_ms",   true);
 const sessLatP95   = new Trend("fwd_sess_lat_p95_ms",   true);
-const sessLatP99   = new Trend("fwd_sess_lat_p99_ms",   true);
 const sessJitter   = new Trend("fwd_sess_jitter_ms",    true);
-const sessBufDelay = new Trend("fwd_sess_buf_delay_ms", true);
 const sessMOS      = new Trend("fwd_sess_mos",          true);
+// Reliable metrics (thresholded)
+const sessDropPct  = new Trend("fwd_sess_drop_pct",     true);
 const cntExpected  = new Counter("fwd_pkts_expected");
 const cntReceived  = new Counter("fwd_pkts_received");
 const cntDropped   = new Counter("fwd_pkts_dropped");
-const cntNoTs      = new Counter("fwd_pkts_no_timestamp"); // pkts with missing send_ts_us
+const cntNoTs      = new Counter("fwd_pkts_no_timestamp");
 const wsConnMs     = new Trend("fwd_ws_conn_ms",        true);
-const firstPktMs   = new Trend("fwd_first_pkt_ms",      true);
 const sessOk       = new Rate("fwd_sess_ok");
 const wsOk         = new Rate("fwd_ws_ok");
 
@@ -229,9 +228,18 @@ function sessionId() {
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
-function percentile(sorted, pct) {
-  if (!sorted.length) return 0;
-  return sorted[Math.min(Math.floor(sorted.length * pct / 100), sorted.length - 1)];
+
+// Approximate p95 from a bucket histogram (20 buckets × 50 ms = 0–1000 ms).
+// Avoids storing per-packet latencies[] array which at 500 VUs × 5588 pkts
+// costs ~22 MB of GC pressure per test.
+function approxP95(total, buckets) {
+  const target = Math.ceil(total * 0.95);
+  let seen = 0;
+  for (let i = 0; i < buckets.length; i++) {
+    seen += buckets[i];
+    if (seen >= target) return (i + 1) * 50; // return upper bound of bucket
+  }
+  return 1000; // all packets in last bucket (>950 ms)
 }
 
 function eModelMOS(latMs, dropFrac) {
@@ -251,12 +259,20 @@ export function receiveAudio() {
   const sid   = sessionId();
   const phase = exec.scenario.name.startsWith("baseline") ? "baseline" : "load";
 
+  // Per-iteration gRPC client: avoids shared-state reconnect churn and
+  // double-close races at high VU counts. load() is per-client but k6
+  // caches the proto parse, so overhead is a single file-read per VU.
+  const grpcClient = new Client();
+  grpcClient.load(GRPC_PROTO_PATH, "audio_forward.proto");
   grpcClient.connect(BRIDGE_GRPC_ADDR, { plaintext: true });
   const stream = new Stream(grpcClient, "audioforward.AudioForwardService/ReceiveAudio");
   let grpcClosed = false;
   function closeGrpc() { if (!grpcClosed) { grpcClosed = true; grpcClient.close(); } }
 
-  const latencies  = [];
+  // Bucket histogram instead of latencies[] array.
+  // 20 buckets × 50 ms covers 0–1000 ms; beyond that lands in bucket 19.
+  let latSum       = 0;
+  const buckets    = new Array(20).fill(0);
   let seqLast      = -1;
   let pktsDropped  = 0;
   let pktsRecvd    = 0;
@@ -264,7 +280,7 @@ export function receiveAudio() {
   let jitter       = 0;     // running smoothed jitter in µs
   let streamEnded  = false;
   let firstPktSeen = false;
-  let startTs      = 0;     // set when stream.write() is called (see below)
+  let startTs      = 0;     // set just before stream.write()
 
   stream.on("data", (pkt) => {
     // proto3 int64 fields arrive as lowerCamelCase via proto3 JSON mapping.
@@ -286,24 +302,22 @@ export function receiveAudio() {
     const sendUs  = Number(BigInt(rawSendTs));
     const latMs   = (recvUs - sendUs) / 1000;
 
-    // Time-to-first-packet: measures WS→Bridge→gRPC full-stack readiness.
-    // startTs is set just before stream.write() so it captures only network
-    // + sender delay, not VU setup overhead.
+    // Time-to-first-packet (informational — see threshold notes).
     if (!firstPktSeen) {
       firstPktSeen = true;
       firstPktMs.add(Date.now() - startTs);
     }
 
-    // Sanity-cap: if latency is negative (clock skew) or implausibly large
-    // (>60 s means something is wrong), skip it to avoid poisoning the Trend.
+    // Sanity-cap: skip negative (clock skew) or implausibly large values.
     if (latMs < 0 || latMs > 60_000) {
       cntNoTs.add(1);
       return;
     }
 
-    latencies.push(latMs);
     pktsRecvd++;
     pktLatency.add(latMs);
+    latSum += latMs;
+    buckets[Math.min(Math.floor(latMs / 50), 19)]++;
 
     if (seqLast >= 0 && seq > seqLast + 1) pktsDropped += seq - seqLast - 1;
     seqLast = seq;
@@ -328,14 +342,11 @@ export function receiveAudio() {
 
     const pktsExpect = pktsDropped + pktsRecvd;
     const dropFrac   = pktsExpect > 0 ? pktsDropped / pktsExpect : 0;
-    const sorted     = latencies.slice().sort((a, b) => a - b);
-    const latMean    = latencies.reduce((s, v) => s + v, 0) / latencies.length;
-    const p50        = percentile(sorted, 50);
-    const p95        = percentile(sorted, 95);
-    const p99        = percentile(sorted, 99);
-    // RFC 3550 smoothed jitter is in µs; convert to ms.
+    // Bucket-based p95: O(20) instead of O(N log N) sort; saves memory at scale.
+    const latMean    = pktsRecvd > 0 ? latSum / pktsRecvd : 0;
+    const p95        = approxP95(pktsRecvd, buckets);
+    // RFC 3550 smoothed jitter in µs → ms.
     const jitterMs   = jitter / 1000;
-    // Use p95 + jitter for MOS — better represents worst-case QoE than mean alone.
     const mos        = eModelMOS(p95 + jitterMs, dropFrac);
 
     cntExpected.add(pktsExpect);
@@ -343,22 +354,18 @@ export function receiveAudio() {
     cntDropped.add(pktsDropped);
     sessDropPct.add(dropFrac * 100);
     sessLatMean.add(latMean);
-    sessLatP50.add(p50);
     sessLatP95.add(p95);
-    sessLatP99.add(p99);
     sessJitter.add(jitterMs);
-    sessBufDelay.add(p95 - p50);
     sessMOS.add(mos);
     sessOk.add(1);
 
-    // Log always for baseline (reference), only when DEBUG=1 during load
-    // to avoid console overhead at 500+ VUs.
-    if (phase === "baseline" || DEBUG) {
+    // Log baseline always; load phase only for first 3 VUs or when DEBUG=1.
+    // At 500 VUs, logging every session floods CI output with ~500 lines/run.
+    if (phase === "baseline" || (DEBUG && exec.vu.idInTest <= 3)) {
       console.log(
         `[${phase}][${sid}] pkts=${pktsRecvd}  drop=${(dropFrac*100).toFixed(2)}%` +
         `  lat_mean=${latMean.toFixed(1)}ms  lat_p95=${p95.toFixed(1)}ms` +
-        `  jitter=${jitterMs.toFixed(1)}ms  buf_delay=${(p95-p50).toFixed(1)}ms` +
-        `  MOS=${mos.toFixed(2)}`
+        `  jitter=${jitterMs.toFixed(1)}ms  MOS=${mos.toFixed(2)}`
       );
     }
 
