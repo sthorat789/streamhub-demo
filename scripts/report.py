@@ -74,9 +74,12 @@ def k6_rows(summary: dict) -> list[dict]:
             continue
         vals = m.get("values", {})
         thresholds = m.get("thresholds", {})
-        thr_ok = all(t.get("ok", True) for t in thresholds.values())
+        thr_ok = all(
+            (t.get("ok", True) if isinstance(t, dict) else bool(t))
+            for t in thresholds.values()
+        )
         thr_str = " / ".join(
-            f"{'✓' if t.get('ok') else '✗'} {expr}"
+            f"{'\u2713' if (t.get('ok') if isinstance(t, dict) else bool(t)) else '\u2717'} {expr}"
             for expr, t in thresholds.items()
         ) if thresholds else "—"
 

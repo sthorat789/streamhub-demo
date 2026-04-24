@@ -227,9 +227,10 @@ export function receiveAudio() {
   let seqLast     = -1;
   let pktsDropped = 0;
   let pktsRecvd   = 0;
-  let prevTransit = null; // RFC 3550 smoothed jitter state
-  let jitter      = 0;    // running smoothed IPDV in µs
-  let streamEnded = false;
+  let prevTransit   = null; // RFC 3550 smoothed jitter state
+  let jitter        = 0;    // running smoothed IPDV in µs
+  let streamEnded   = false;
+  let streamCleanly = false; // true only if "end" fired (not a timeout/error)
 
   // Latency drift: compare mean of first-5 vs last-5 packet latencies.
   // Positive drift  → pipeline accumulating delay (StreamHub/Bridge buffering).
@@ -238,6 +239,44 @@ export function receiveAudio() {
   const earlyLats = []; // first DRIFT_N latency samples
   const lateLats  = new Array(DRIFT_N); // circular buffer for last DRIFT_N
   let   lateIdx   = 0;
+
+  // flush() records all per-session metrics and is called after the polling
+  // loop exits regardless of whether "end" fired. This ensures metrics are
+  // captured even when k6 interrupts the iteration (graceful-stop timeout).
+  function flush() {
+    if (!pktsRecvd) {
+      sessOk.add(0);
+      return;
+    }
+    const pktsExpect = pktsDropped + pktsRecvd;
+    const dropFrac   = pktsExpect > 0 ? pktsDropped / pktsExpect : 0;
+    const jitterMs   = jitter / 1000;
+
+    // Latency drift: mean(last-5) − mean(first-5).
+    const mean = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
+    const earlyMean = earlyLats.length ? mean(earlyLats) : 0;
+    const lateSlice = lateLats.slice(0, Math.min(lateIdx, DRIFT_N)).filter((v) => v !== undefined);
+    const lateMean  = lateSlice.length ? mean(lateSlice) : 0;
+    const drift     = lateMean - earlyMean;
+
+    cntExpected.add(pktsExpect);
+    cntReceived.add(pktsRecvd);
+    cntDropped.add(pktsDropped);
+    sessDropPct.add(dropFrac * 100);
+    sessJitter.add(jitterMs);
+    sessLatDrift.add(drift);
+    // sessOk=1 only if the stream ended cleanly (not timed-out or errored).
+    sessOk.add(streamCleanly ? 1 : 0);
+
+    if (DEBUG && exec.vu.idInTest <= 3) {
+      const hint = drift > 20 ? "DELAY" : dropFrac > 0.01 ? "DROP/CORRUPT" : "OK";
+      console.log(
+        `[${sid}] pkts=${pktsRecvd}  drop=${(dropFrac*100).toFixed(2)}%` +
+        `  jitter=${jitterMs.toFixed(1)}ms  drift=${drift.toFixed(1)}ms` +
+        `  clean=${streamCleanly}  [${hint}]`
+      );
+    }
+  }
 
   stream.on("data", (pkt) => {
     // send_ts_us → sendTsUs (proto3 JSON lowerCamelCase). int64 arrives as decimal string.
@@ -283,49 +322,13 @@ export function receiveAudio() {
   });
 
   stream.on("end", () => {
-    if (!pktsRecvd) {
-      console.error(`[${sid}] stream ended — 0 packets received`);
-      sessOk.add(0);
-      streamEnded = true;
-      closeGrpc();
-      return;
-    }
-
-    const pktsExpect = pktsDropped + pktsRecvd;
-    const dropFrac   = pktsExpect > 0 ? pktsDropped / pktsExpect : 0;
-    const jitterMs   = jitter / 1000;
-
-    // Compute latency drift: mean(late) − mean(early).
-    const mean = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
-    const earlyMean = earlyLats.length ? mean(earlyLats) : 0;
-    const lateSlice = lateLats.slice(0, Math.min(lateIdx, DRIFT_N)).filter((v) => v !== undefined);
-    const lateMean  = lateSlice.length ? mean(lateSlice) : 0;
-    const drift     = lateMean - earlyMean;
-
-    cntExpected.add(pktsExpect);
-    cntReceived.add(pktsRecvd);
-    cntDropped.add(pktsDropped);
-    sessDropPct.add(dropFrac * 100);
-    sessJitter.add(jitterMs);
-    sessLatDrift.add(drift);
-    sessOk.add(1);
-
-    if (DEBUG && exec.vu.idInTest <= 3) {
-      // Diagnosis: positive drift = buffering delay; drops without drift = corruption.
-      const hint = drift > 20 ? "DELAY" : dropFrac > 0.01 ? "DROP/CORRUPT" : "OK";
-      console.log(
-        `[${sid}] pkts=${pktsRecvd}  drop=${(dropFrac*100).toFixed(2)}%` +
-        `  jitter=${jitterMs.toFixed(1)}ms  drift=${drift.toFixed(1)}ms  [${hint}]`
-      );
-    }
-
-    streamEnded = true;
+    streamCleanly = true;
+    streamEnded   = true;
     closeGrpc();
   });
 
   stream.on("error", (err) => {
     console.error(`[${sid}] gRPC error: ${err.message || JSON.stringify(err)}`);
-    sessOk.add(0);
     streamEnded = true;
     closeGrpc();
   });
@@ -333,11 +336,15 @@ export function receiveAudio() {
   stream.write({ session_id: sid, wait_s: WAIT_S });
   stream.end(); // half-close — correct for server-streaming RPCs
 
-  // Poll every 50 ms — each wakeup drains buffered "data" callbacks.
-  // Date.now() inside each callback is then accurate to ±50 ms.
-  while (!streamEnded) { sleep(0.05); }
+  // Poll every 50 ms — each wakeup drains buffered "data" callbacks so
+  // Date.now() is accurate to ±50 ms. Hard deadline = SESSION_LIFE_S so
+  // this loop always exits and flush() always records metrics, even when
+  // k6 interrupts the iteration before the "end" event fires.
+  const deadline = Date.now() + SESSION_LIFE_S * 1000;
+  while (!streamEnded && Date.now() < deadline) { sleep(0.05); }
+
+  flush();    // always record whatever was accumulated
   closeGrpc();
-}
 
 // ─── Scenario: sendAudio ──────────────────────────────────────────────────────
 // Used by both load_receiver and load_sender (sendAudio).
