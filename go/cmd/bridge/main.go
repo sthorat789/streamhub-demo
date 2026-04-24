@@ -201,8 +201,9 @@ func (b *bridgeServer) PushAudio(stream pb.AudioForwardService_PushAudioServer) 
 		}
 
 		// Stamp arrival time if StreamHub didn't set it.
+		pkt.RecvTsUs = time.Now().UnixMicro()
 		if pkt.SendTsUs == 0 {
-			pkt.SendTsUs = time.Now().UnixMicro()
+			pkt.SendTsUs = pkt.RecvTsUs
 		}
 
 		select {

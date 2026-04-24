@@ -51,12 +51,15 @@ message AudioPacket {
   // Monotonic per-session counter. Gaps indicate dropped packets.
   uint64 seq         = 1;
   // StreamHub wall-clock time in microseconds (UTC epoch) when this chunk
-  // arrived over WebSocket. k6 receiver computes pipeline latency as
-  // Date.now()*1000 − send_ts_us (includes WS→StreamHub→Bridge→k6 hops).
+  // arrived over WebSocket and was about to be forwarded to Bridge.
   int64  send_ts_us  = 2;
   // Session identifier — must match ReceiveRequest.session_id.
   string session_id  = 3;
   uint32 sample_rate = 4;  // e.g. 16000
   uint32 channels    = 5;  // 1 = mono, 2 = stereo
   bytes  payload     = 6;  // raw PCM bytes (16-bit signed little-endian)
+  // Bridge wall-clock time in microseconds (UTC epoch) when this chunk was
+  // received from StreamHub over PushAudio.
+  // Accurate StreamHub→Bridge latency = recv_ts_us - send_ts_us.
+  int64  recv_ts_us  = 7;
 }

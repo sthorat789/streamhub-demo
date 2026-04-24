@@ -91,11 +91,13 @@ const wav          = parseWav(wavBuffer);
 const BYTES_PER_MS = (wav.sampleRate * (wav.bitsPerSample / 8) * wav.channels) / 1000;
 const CHUNK_BYTES  = Math.max(1, Math.floor(CHUNK_MS * BYTES_PER_MS));
 const DURATION_S   = wav.dataSize / (BYTES_PER_MS * 1000);
+const EXPECTED_PKTS = Math.ceil(wav.dataSize / CHUNK_BYTES);
 
 if (__VU === 0) {
   console.log(
     `WAV: ${AUDIO_FILE}  ${wav.sampleRate} Hz  ch=${wav.channels}` +
-    `  ${DURATION_S.toFixed(1)} s  chunk=${CHUNK_BYTES} B @ ${CHUNK_MS} ms`
+    `  ${DURATION_S.toFixed(1)} s  chunk=${CHUNK_BYTES} B @ ${CHUNK_MS} ms` +
+    `  expected_pkts=${EXPECTED_PKTS}`
   );
   console.log(`gRPC receiver → ${BRIDGE_GRPC_ADDR}  WS sender → ${WS_URL}`);
 }
@@ -167,21 +169,18 @@ export const options = {
     fwd_ws_ok:         ["rate>0.99"],  // ≥99% WS connections succeed
     fwd_ws_conn_ms:    ["p(95)<3000"],// WS handshake p95 < 3 s
     fwd_sess_drop_pct: ["avg<1"],      // average session drop rate < 1%
+    fwd_bridge_latency_ms: ["p(95)<50"], // StreamHub→Bridge packet latency
     fwd_sess_jitter_ms:["avg<50"],    // mean per-session IPDV < 50 ms
-    // fwd_pkt_latency_ms: NOT thresholded — k6 gRPC "data" callbacks are dispatched
-    // asynchronously (all fire at once after grpcClient.close()), so Date.now() inside
-    // them returns the same post-close timestamp, making latency values wrong.
     // fwd_sess_lat_drift_ms: informational — positive drift = StreamHub buffering/adding
     // delay; near-zero drift + drops = StreamHub corrupting/dropping packets.
   },
 };
 
 // ─── Custom metrics ────────────────────────────────────────────────────────────
-// Latency: Date.now() at receiver − send_ts_us (µs, set by StreamHub on WS recv).
-// ±50 ms accurate because the polling loop wakes every 50 ms.
-const pktLatency    = new Trend("fwd_pkt_latency_ms",    true);
+// Accurate StreamHub→Bridge latency: recv_ts_us - send_ts_us, both set in Go.
+const bridgeLatency = new Trend("fwd_bridge_latency_ms", true);
 // Jitter: RFC 3550 smoothed IPDV per session (µs → ms). High jitter with low
-// drop = StreamHub output spacing is irregular (jitter buffer required).
+// drop = StreamHub→Bridge spacing is irregular (jitter buffer required).
 const sessJitter    = new Trend("fwd_sess_jitter_ms",    true);
 // Latency drift: mean(last-5 pkts) − mean(first-5 pkts) per session.
 // Positive drift = pipeline is accumulating delay (StreamHub/Bridge buffering).
@@ -229,10 +228,10 @@ export function receiveAudio() {
   let seqLast     = -1;
   let pktsDropped = 0;
   let pktsRecvd   = 0;
-  let prevTransit   = null; // RFC 3550 smoothed jitter state
-  let jitter        = 0;    // running smoothed IPDV in µs
-  let streamEnded   = false;
-  let streamCleanly = false; // true only if "end" fired (not a timeout/error)
+  let pktsCorrupt = 0;
+  let prevTransit = null; // RFC 3550 smoothed jitter state
+  let jitter      = 0;    // running smoothed IPDV in µs
+  let streamEnded = false;
 
   // Latency drift: compare mean of first-5 vs last-5 packet latencies.
   // Positive drift  → pipeline accumulating delay (StreamHub/Bridge buffering).
@@ -243,10 +242,9 @@ export function receiveAudio() {
   let   lateIdx   = 0;
 
   stream.on("data", (pkt) => {
-    // send_ts_us → sendTsUs (proto3 JSON lowerCamelCase). int64 arrives as decimal string.
-    // Date.now() accurate to ±50 ms because the polling loop wakes every 50 ms.
-    const recvUs    = Number(BigInt(Date.now()) * 1000n);
+    // proto3 JSON lowerCamelCase: send_ts_us → sendTsUs, recv_ts_us → recvTsUs.
     const rawSendTs = pkt.sendTsUs;
+    const rawRecvTs = pkt.recvTsUs;
     const seq       = parseInt(pkt.seq || "0", 10);
 
     // Sequence-gap drop detection (reliable: no timestamp required).
@@ -257,19 +255,22 @@ export function receiveAudio() {
     // Corruption probe: proto3 bytes → base64 string in k6 gRPC.
     // Empty string = StreamHub sent a zero-length PCM payload (truncation/corruption).
     if (!pkt.payload || pkt.payload.length === 0) {
+      pktsCorrupt++;
       cntCorrupt.add(1);
     }
 
-    // Skip latency + jitter if StreamHub didn't embed a timestamp.
+    // Skip latency + jitter unless both Go-side timestamps are present.
     if (!rawSendTs || rawSendTs === "0" || rawSendTs === 0) return;
+    if (!rawRecvTs || rawRecvTs === "0" || rawRecvTs === 0) return;
 
     const sendUs = Number(BigInt(rawSendTs));
+    const recvUs = Number(BigInt(rawRecvTs));
     const latMs  = (recvUs - sendUs) / 1000;
 
     // Sanity-cap: skip negative (clock skew) or implausibly large values.
     if (latMs < 0 || latMs > 60_000) return;
 
-    pktLatency.add(latMs);
+    bridgeLatency.add(latMs);
 
     // Drift tracking.
     if (earlyLats.length < DRIFT_N) earlyLats.push(latMs);
@@ -286,8 +287,7 @@ export function receiveAudio() {
   });
 
   stream.on("end", () => {
-    streamCleanly = true;
-    streamEnded   = true;
+    streamEnded = true;
   });
 
   stream.on("error", (err) => {
@@ -302,21 +302,27 @@ export function receiveAudio() {
   const deadline = Date.now() + SESSION_LIFE_S * 1000;
   while (!streamEnded && Date.now() < deadline) { sleep(0.05); }
 
-  // Record session success based on "end" firing — NOT on pktsRecvd.
-  // In k6 gRPC streaming, "data" callbacks are dispatched asynchronously,
-  // only after grpcClient.close(). sessOk must not depend on pktsRecvd.
-  // "end" = server closed stream cleanly = all packets were forwarded.
-  sessOk.add(streamCleanly ? 1 : 0);
-
-  // Close then yield — buffered "data" callbacks fire during sleep().
+  // Close then drain buffered async callbacks until packet count stabilizes.
   closeGrpc();
-  sleep(0.5);
+  let stableTicks = 0;
+  let lastPktsRecvd = -1;
+  const drainDeadline = Date.now() + 2000;
+  while (Date.now() < drainDeadline && stableTicks < 5) {
+    sleep(0.05);
+    if (pktsRecvd === lastPktsRecvd) {
+      stableTicks++;
+    } else {
+      lastPktsRecvd = pktsRecvd;
+      stableTicks = 0;
+    }
+  }
 
-  // Best-effort per-session drop/jitter/drift — recorded only if data callbacks
-  // fired during sleep(0.5). Thresholds pass vacuously (avg=0) if they didn't.
+  const pktsExpect = pktsDropped + pktsRecvd;
+  const dropFrac   = pktsExpect > 0 ? pktsDropped / pktsExpect : 0;
+  const sessPassed = pktsRecvd === EXPECTED_PKTS && pktsDropped === 0 && pktsCorrupt === 0;
+  sessOk.add(sessPassed ? 1 : 0);
+
   if (pktsRecvd > 0) {
-    const pktsExpect = pktsDropped + pktsRecvd;
-    const dropFrac   = pktsExpect > 0 ? pktsDropped / pktsExpect : 0;
     const jitterMs   = jitter / 1000;
     const mean      = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
     const earlyMean = earlyLats.length ? mean(earlyLats) : 0;
@@ -334,10 +340,13 @@ export function receiveAudio() {
     if (DEBUG && exec.vu.idInTest <= 3) {
       const hint = drift > 20 ? "DELAY" : dropFrac > 0.01 ? "DROP/CORRUPT" : "OK";
       console.log(
-        `[${sid}] pkts=${pktsRecvd}  drop=${(dropFrac*100).toFixed(2)}%` +
-        `  jitter=${jitterMs.toFixed(1)}ms  drift=${drift.toFixed(1)}ms  [${hint}]`
+        `[${sid}] pkts=${pktsRecvd}/${EXPECTED_PKTS}  drop=${(dropFrac*100).toFixed(2)}%` +
+        `  corrupt=${pktsCorrupt}  jitter=${jitterMs.toFixed(1)}ms` +
+        `  drift=${drift.toFixed(1)}ms  ok=${sessPassed}  [${hint}]`
       );
     }
+  } else if (DEBUG && exec.vu.idInTest <= 3) {
+    console.log(`[${sid}] pkts=0/${EXPECTED_PKTS}  ok=${sessPassed}  [NO_DATA]`);
   }
 }
 
