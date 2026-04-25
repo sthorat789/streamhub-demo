@@ -247,9 +247,9 @@ HTML_TEMPLATE = """\
     {k6_table}
   </div>
 
-    <!-- Native e2e metrics -->
+    <!-- StreamHub e2e metrics -->
     <div class="section">
-        <div class="section-header">Native End-To-End Metrics</div>
+        <div class="section-header">StreamHub E2E Metrics</div>
         {e2e_table}
     </div>
 
@@ -370,9 +370,8 @@ def build_chart_section(chart_data: str) -> str:
 
 def build_e2e_table(summary: dict) -> str:
     if not summary:
-        return "<p style='padding:20px;color:#aaa'>No native e2e summary found.</p>"
+        return "<p style='padding:20px;color:#aaa'>No e2e summary found.</p>"
     rows = [
-        ("Bridge latency p95", f"{summary.get('bridge_latency_p95_ms', 0):.3f} ms", "—"),
         ("E2E latency p95", f"{summary.get('e2e_latency_p95_ms', 0):.2f} ms", "✓ p95<500ms" if summary.get('thresholds', {}).get('e2e_latency_p95_lt_500ms') else "✗ p95<500ms"),
         ("Session success rate", f"{summary.get('sess_ok_rate', 0)*100:.1f}%", "✓ rate>95%" if summary.get('thresholds', {}).get('sess_ok_rate_gt_095') else "✗ rate>95%"),
         ("Avg drop %", f"{summary.get('sess_drop_pct_avg', 0):.2f}%", "✓ avg<1%" if summary.get('thresholds', {}).get('sess_drop_pct_avg_lt_1') else "✗ avg<1%"),

@@ -154,15 +154,13 @@ jobs:
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
           go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.4.0
 
-      - name: Generate proto stubs + build Bridge + e2eprobe
+      - name: Generate proto stubs + build Bridge
         working-directory: go
         run: |
           bash generate_proto.sh
           go mod tidy
           go build -o bin/bridge ./cmd/bridge
-          go build -o bin/e2eprobe ./cmd/e2eprobe
           echo "Bridge binary: $(ls -lh bin/bridge)"
-          echo "E2E probe binary: $(ls -lh bin/e2eprobe)"
 
       # ── Install k6 ─────────────────────────────────────────────────────────
       - name: Install k6
@@ -191,7 +189,8 @@ jobs:
         run: |
           go/bin/bridge \
             --port=50052 \
-            --record-dir=recordings &
+            --record-dir=recordings \
+            --stats-out=results/e2e_latency.json &
           echo "BRIDGE_PID=$!" >> "$GITHUB_ENV"
           echo "Bridge started (PID $!)"
 

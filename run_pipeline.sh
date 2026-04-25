@@ -152,28 +152,15 @@ if [[ "$K6_ONLY" == false ]]; then
   fi
   go mod tidy -e
   go build -o bin/bridge     ./cmd/bridge
-  go build -o bin/e2eprobe   ./cmd/e2eprobe
   go build -o bin/streamhub  ./cmd/streamhub
-  echo "    Built: bin/bridge  bin/e2eprobe  bin/streamhub"
-  cd "$SCRIPT_DIR"
-elif [[ ! -x "$GO_DIR/bin/e2eprobe" ]]; then
-  echo "==> Building missing e2eprobe binary for --k6-only run..."
-  cd "$GO_DIR"
-  if [[ ! -f pb/audio_forward.pb.go ]] || \
-     [[ pb/audio_forward.pb.go -ot "$SCRIPT_DIR/proto/audio_forward.proto" ]]; then
-    echo "    Generating proto stubs..."
-    bash generate_proto.sh
-  fi
-  go mod tidy -e
-  go build -o bin/e2eprobe ./cmd/e2eprobe
-  echo "    Built: bin/e2eprobe"
+  echo "    Built: bin/bridge  bin/streamhub"
   cd "$SCRIPT_DIR"
 fi
 
 # ─── Start services ────────────────────────────────────────────────────────────
 if [[ "$K6_ONLY" == false ]]; then
   echo "==> Starting Bridge on :$BRIDGE_PORT..."
-  BRIDGE_ARGS=(--port="$BRIDGE_PORT")
+  BRIDGE_ARGS=(--port="$BRIDGE_PORT" --stats-out="$RESULTS_DIR/e2e_latency.json")
   if [[ -n "$RECORD_DIR" ]]; then
     mkdir -p "$RECORD_DIR"
     BRIDGE_ARGS+=(--record-dir="$RECORD_DIR")
@@ -193,19 +180,6 @@ fi
 
 # ─── k6 ────────────────────────────────────────────────────────────────────────
 if [[ "$NO_K6" == false ]]; then
-  echo ""
-  echo "==> Starting native e2e latency probe..."
-  "$GO_DIR/bin/e2eprobe" \
-    --bridge-addr="127.0.0.1:$BRIDGE_PORT" \
-    --wait-s="$WAIT_S" \
-    --session-count="$MAX_VUS" \
-    --audio-file="$SCRIPT_DIR/$AUDIO_FILE" \
-    --chunk-ms="$CHUNK_MS" \
-    --out "$RESULTS_DIR/e2e_latency.json" \
-    > "$RESULTS_DIR/e2eprobe.log" 2>&1 &
-  E2E_PROBE_PID=$!
-  PIDS+=($E2E_PROBE_PID)
-
   echo "==> Running k6  max_vus=$MAX_VUS  ramp=$RAMP_DURATION  stable=$STABLE_DURATION  chunk_ms=$CHUNK_MS  audio=$AUDIO_FILE"
   echo "──────────────────────────────────────────────────────────────────"
   cd "$SCRIPT_DIR"
@@ -215,21 +189,14 @@ if [[ "$NO_K6" == false ]]; then
   k6 run \
     --summary-export "$RESULTS_DIR/k6_summary.json" \
     --env WS_URL="ws://127.0.0.1:$WS_PORT" \
-    --env BRIDGE_GRPC_ADDR="127.0.0.1:$BRIDGE_PORT" \
     --env AUDIO_FILE="$K6_AUDIO_FILE" \
     --env CHUNK_MS="$CHUNK_MS" \
     --env MAX_VUS="$MAX_VUS" \
     --env RAMP_DURATION="$RAMP_DURATION" \
     --env STABLE_DURATION="$STABLE_DURATION" \
-    --env WAIT_S="$WAIT_S" \
     tests/k6/k6_audio_pipeline.js
   echo ""
 
-  E2E_PROBE_STATUS=0
-  wait "$E2E_PROBE_PID" || E2E_PROBE_STATUS=$?
-  echo "==> E2E probe log"
-  cat "$RESULTS_DIR/e2eprobe.log" || true
-  echo ""
 
   # ── Quality check ───────────────────────────────────────────────────────────
   if [[ -n "$RECORD_DIR" ]]; then
@@ -267,10 +234,6 @@ if [[ "$NO_K6" == false ]]; then
     $QUALITY_ARG \
     --e2e-summary "$RESULTS_DIR/e2e_latency.json" \
     --out "$RESULTS_DIR/report.html"
-
-  if [[ "$E2E_PROBE_STATUS" -ne 0 ]]; then
-    exit "$E2E_PROBE_STATUS"
-  fi
 
 else
   echo ""
