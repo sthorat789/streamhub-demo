@@ -14,8 +14,10 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
 	pb "streamhub/pb"
 )
@@ -112,13 +114,44 @@ func percentile(sorted []float64, p float64) float64 {
 	return sorted[idx]
 }
 
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func runSession(stub pb.AudioForwardServiceClient, sid string, waitS uint32, timeout time.Duration, expectedPkts uint64) sessionResult {
 	res := sessionResult{SessionID: sid}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
+	deadline := time.Now().Add(timeout)
 
-	stream, err := stub.ReceiveAudio(ctx, &pb.ReceiveRequest{SessionId: sid, WaitS: waitS})
-	if err != nil {
+	var stream pb.AudioForwardService_ReceiveAudioClient
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			res.Error = fmt.Sprintf("session %s did not appear within %s", sid, timeout)
+			return res
+		}
+		attemptWait := waitS
+		remainingS := uint32(math.Ceil(remaining.Seconds()))
+		if remainingS == 0 {
+			remainingS = 1
+		}
+		if attemptWait == 0 || attemptWait > remainingS {
+			attemptWait = remainingS
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), remaining)
+		s, err := stub.ReceiveAudio(ctx, &pb.ReceiveRequest{SessionId: sid, WaitS: attemptWait})
+		cancel()
+		if err == nil {
+			stream = s
+			break
+		}
+		code := status.Code(err)
+		if code == codes.DeadlineExceeded || code == codes.NotFound {
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
 		res.Error = err.Error()
 		return res
 	}
@@ -152,8 +185,27 @@ func runSession(stub pb.AudioForwardServiceClient, sid string, waitS uint32, tim
 		}
 	}
 
-	stats, err := stub.GetSessionStats(context.Background(), &pb.SessionStatsRequest{SessionId: sid})
-	if err != nil {
+	var stats *pb.SessionStats
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if res.Error == "" {
+				res.Error = fmt.Sprintf("session %s stats not available within %s", sid, timeout)
+			}
+			return res
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), minDuration(remaining, 3*time.Second))
+		s, err := stub.GetSessionStats(ctx, &pb.SessionStatsRequest{SessionId: sid})
+		cancel()
+		if err == nil {
+			stats = s
+			break
+		}
+		code := status.Code(err)
+		if code == codes.NotFound || code == codes.DeadlineExceeded {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
 		if res.Error == "" {
 			res.Error = err.Error()
 		}

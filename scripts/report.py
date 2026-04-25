@@ -392,13 +392,12 @@ def main():
     e2e      = parse_e2e_summary(args.e2e_summary)
     quality  = parse_quality(args.quality)
 
-    k6_pass  = k6_all_thresholds_pass(summary) if summary else True
+    ts       = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    rows     = k6_rows(summary)
+    k6_pass  = all(r["ok"] for r in rows) if rows else True
     e2e_pass = all(e2e.get("thresholds", {}).values()) if e2e else True
     q_pass   = quality_all_pass(quality)        if quality else True
     overall  = k6_pass and e2e_pass and q_pass
-
-    ts       = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    rows     = k6_rows(summary)
     cdata    = latency_chart_data(summary)
 
     # Summary cards
