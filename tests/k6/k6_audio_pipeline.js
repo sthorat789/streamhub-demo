@@ -197,12 +197,11 @@ function stampBinaryFrame(pcmBuf) {
 }
 
 // ─── Session ID ────────────────────────────────────────────────────────────────
-// Uses exec.scenario.iterationInTest — a per-scenario global counter that
-// increments for each new iteration regardless of VU number.
-// receiver iter N and sender iter N will always share the same session_id,
-// enabling correct pairing on Bridge even at high VU counts.
+// In this sender-only load shape, each VU runs one long-lived iteration.
+// Use the test-wide VU id as the session suffix so concurrent senders don't
+// collapse onto the same Bridge session.
 function sessionId() {
-  return `ld-${exec.scenario.iterationInTest}`;
+  return `ld-${exec.vu.idInTest - 1}`;
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
