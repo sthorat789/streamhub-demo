@@ -187,12 +187,35 @@ jobs:
       # ── Start Bridge (plain binary, with recording enabled) ────────────────
       - name: Start Bridge
         run: |
+          EXPECTED_PKTS=$(python3 - <<'PYEOF'
+          import struct, sys, math
+          wav, chunk_ms = "data/best_16k.wav", 20
+          with open(wav, "rb") as f:
+              data = f.read()
+          pos = 12
+          while pos + 8 <= len(data):
+              tag = data[pos:pos+4]
+              sz  = struct.unpack_from("<I", data, pos+4)[0]
+              if tag == b"data":
+                  sr       = struct.unpack_from("<I", data, 24)[0]
+                  bits     = struct.unpack_from("<H", data, 34)[0]
+                  channels = struct.unpack_from("<H", data, 22)[0]
+                  bpms     = sr * (bits // 8) * channels // 1000
+                  chunk_b  = max(1, bpms * chunk_ms)
+                  print(math.ceil(sz / chunk_b))
+                  sys.exit(0)
+              pos += 8 + sz + (sz % 2)
+          print(0)
+          PYEOF
+          )
+          echo "Expected packets/session: $EXPECTED_PKTS"
           go/bin/bridge \
             --port=50052 \
             --record-dir=recordings \
-            --stats-out=results/e2e_latency.json &
+            --stats-out=results/e2e_latency.json \
+            --expected-packets="$EXPECTED_PKTS" &
           echo "BRIDGE_PID=$!" >> "$GITHUB_ENV"
-          echo "Bridge started (PID $!)"
+          echo "Bridge started (PID $!) expected_pkts=$EXPECTED_PKTS"
 
       # ── Build StreamHub image locally using GHA layer cache ─────────────────
       # Avoids pulling from GHCR (private package auth / network timeout issues).

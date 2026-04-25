@@ -141,6 +141,32 @@ if [[ ! -f "$SCRIPT_DIR/$AUDIO_FILE" ]]; then
   echo "ERROR: Audio file not found: $SCRIPT_DIR/$AUDIO_FILE"; exit 1
 fi
 
+# Compute expected packets per session from WAV header (data_size / chunk_bytes).
+# Bridge uses this to calculate drop % and mark sessions OK/FAIL.
+EXPECTED_PKTS=$(python3 - <<'PYEOF'
+import struct, sys, math
+wav = "$SCRIPT_DIR/$AUDIO_FILE"
+chunk_ms = $CHUNK_MS
+with open(wav, "rb") as f:
+    data = f.read()
+pos = 12
+while pos + 8 <= len(data):
+    tag = data[pos:pos+4]
+    sz  = struct.unpack_from("<I", data, pos+4)[0]
+    if tag == b"data":
+        sr       = struct.unpack_from("<I", data, 24)[0]
+        bits     = struct.unpack_from("<H", data, 34)[0]
+        channels = struct.unpack_from("<H", data, 22)[0]
+        bpms     = sr * (bits // 8) * channels // 1000
+        chunk_b  = max(1, bpms * chunk_ms)
+        print(math.ceil(sz / chunk_b))
+        sys.exit(0)
+    pos += 8 + sz + (sz % 2)
+print(0)
+PYEOF
+)
+echo "    Expected packets/session: $EXPECTED_PKTS  (chunk_ms=$CHUNK_MS)"
+
 # ─── Build ─────────────────────────────────────────────────────────────────────
 if [[ "$K6_ONLY" == false ]]; then
   echo "==> Building Go binaries..."
@@ -160,7 +186,7 @@ fi
 # ─── Start services ────────────────────────────────────────────────────────────
 if [[ "$K6_ONLY" == false ]]; then
   echo "==> Starting Bridge on :$BRIDGE_PORT..."
-  BRIDGE_ARGS=(--port="$BRIDGE_PORT" --stats-out="$RESULTS_DIR/e2e_latency.json")
+  BRIDGE_ARGS=(--port="$BRIDGE_PORT" --stats-out="$RESULTS_DIR/e2e_latency.json" --expected-packets="$EXPECTED_PKTS")
   if [[ -n "$RECORD_DIR" ]]; then
     mkdir -p "$RECORD_DIR"
     BRIDGE_ARGS+=(--record-dir="$RECORD_DIR")
