@@ -32,6 +32,9 @@ type sessionResult struct {
 	PacketsReceived uint64  `json:"packets_received"`
 	PacketsDropped  uint64  `json:"packets_dropped"`
 	CorruptPackets  uint64  `json:"corrupt_packets"`
+	BridgeAvgMs     float64 `json:"bridge_latency_avg_ms"`
+	BridgeP95Ms     float64 `json:"bridge_latency_p95_ms"`
+	BridgeMaxMs     float64 `json:"bridge_latency_max_ms"`
 	LatencyAvgMs    float64 `json:"latency_avg_ms"`
 	LatencyP95Ms    float64 `json:"latency_p95_ms"`
 	LatencyMaxMs    float64 `json:"latency_max_ms"`
@@ -44,6 +47,9 @@ type summary struct {
 	SessionCount       int             `json:"session_count"`
 	SessOKRate         float64         `json:"sess_ok_rate"`
 	SessDropPctAvg     float64         `json:"sess_drop_pct_avg"`
+	BridgeLatencyAvgMs float64         `json:"bridge_latency_avg_ms"`
+	BridgeLatencyP95Ms float64         `json:"bridge_latency_p95_ms"`
+	BridgeLatencyMaxMs float64         `json:"bridge_latency_max_ms"`
 	E2ELatencyAvgMs    float64         `json:"e2e_latency_avg_ms"`
 	E2ELatencyP95Ms    float64         `json:"e2e_latency_p95_ms"`
 	E2ELatencyMaxMs    float64         `json:"e2e_latency_max_ms"`
@@ -118,6 +124,7 @@ func runSession(stub pb.AudioForwardServiceClient, sid string, waitS uint32, tim
 	}
 
 	latencies := make([]float64, 0, expectedPkts)
+	bridgeLatencies := make([]float64, 0, expectedPkts)
 	for {
 		pkt, err := stream.Recv()
 		if err == io.EOF {
@@ -129,6 +136,12 @@ func runSession(stub pb.AudioForwardServiceClient, sid string, waitS uint32, tim
 		}
 		if len(pkt.Payload) == 0 {
 			res.CorruptPackets++
+		}
+		if pkt.SendTsUs != 0 && pkt.RecvTsUs != 0 {
+			bridgeMs := float64(pkt.RecvTsUs-pkt.SendTsUs) / 1000.0
+			if bridgeMs >= 0 && bridgeMs < 60000 {
+				bridgeLatencies = append(bridgeLatencies, bridgeMs)
+			}
 		}
 		if pkt.ClientSendTsUs != 0 {
 			arrivalUs := time.Now().UnixMicro()
@@ -150,6 +163,16 @@ func runSession(stub pb.AudioForwardServiceClient, sid string, waitS uint32, tim
 	res.PacketsDropped = stats.PacketsDropped
 
 	sort.Float64s(latencies)
+	sort.Float64s(bridgeLatencies)
+	if len(bridgeLatencies) > 0 {
+		sum := 0.0
+		for _, v := range bridgeLatencies {
+			sum += v
+		}
+		res.BridgeAvgMs = sum / float64(len(bridgeLatencies))
+		res.BridgeP95Ms = percentile(bridgeLatencies, 95)
+		res.BridgeMaxMs = bridgeLatencies[len(bridgeLatencies)-1]
+	}
 	if len(latencies) > 0 {
 		sum := 0.0
 		for _, v := range latencies {
@@ -207,6 +230,7 @@ func main() {
 	wg.Wait()
 
 	allLatencies := make([]float64, 0, expectedPkts*uint64(*sessionCount))
+	allBridgeLatencies := make([]float64, 0, expectedPkts*uint64(*sessionCount))
 	okCount := 0
 	dropPctSum := 0.0
 	for _, r := range results {
@@ -222,8 +246,12 @@ func main() {
 			// so use session p95s for an upper-bound aggregate when summarizing.
 			allLatencies = append(allLatencies, r.LatencyP95Ms)
 		}
+		if r.BridgeP95Ms > 0 || r.BridgeAvgMs > 0 || r.BridgeMaxMs > 0 {
+			allBridgeLatencies = append(allBridgeLatencies, r.BridgeP95Ms)
+		}
 	}
 	sort.Float64s(allLatencies)
+	sort.Float64s(allBridgeLatencies)
 
 	sessRate := 0.0
 	if *sessionCount > 0 {
@@ -236,6 +264,20 @@ func main() {
 	latAvg := 0.0
 	latP95 := 0.0
 	latMax := 0.0
+	bridgeAvg := 0.0
+	bridgeP95 := 0.0
+	bridgeMax := 0.0
+	if len(allBridgeLatencies) > 0 {
+		sum := 0.0
+		for _, v := range allBridgeLatencies {
+			sum += v
+			if v > bridgeMax {
+				bridgeMax = v
+			}
+		}
+		bridgeAvg = sum / float64(len(allBridgeLatencies))
+		bridgeP95 = percentile(allBridgeLatencies, 95)
+	}
 	if len(allLatencies) > 0 {
 		sum := 0.0
 		for _, v := range allLatencies {
@@ -253,6 +295,9 @@ func main() {
 		SessionCount:    *sessionCount,
 		SessOKRate:      sessRate,
 		SessDropPctAvg:  dropAvg,
+		BridgeLatencyAvgMs: bridgeAvg,
+		BridgeLatencyP95Ms: bridgeP95,
+		BridgeLatencyMaxMs: bridgeMax,
 		E2ELatencyAvgMs: latAvg,
 		E2ELatencyP95Ms: latP95,
 		E2ELatencyMaxMs: latMax,
@@ -265,6 +310,7 @@ func main() {
 	}
 
 	fmt.Println("E2E PROBE")
+	fmt.Printf("  bridge_latency_p95_ms: %.3f\n", s.BridgeLatencyP95Ms)
 	fmt.Printf("  e2e_latency_p95_ms: %.2f\n", s.E2ELatencyP95Ms)
 	fmt.Printf("  sess_ok_rate: %.2f%%\n", s.SessOKRate*100)
 	fmt.Printf("  sess_drop_pct_avg: %.2f\n", s.SessDropPctAvg)

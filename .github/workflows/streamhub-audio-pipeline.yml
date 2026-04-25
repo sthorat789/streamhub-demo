@@ -154,13 +154,15 @@ jobs:
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
           go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.4.0
 
-      - name: Generate proto stubs + build Bridge
+      - name: Generate proto stubs + build Bridge + e2eprobe
         working-directory: go
         run: |
           bash generate_proto.sh
           go mod tidy
           go build -o bin/bridge ./cmd/bridge
+          go build -o bin/e2eprobe ./cmd/e2eprobe
           echo "Bridge binary: $(ls -lh bin/bridge)"
+          echo "E2E probe binary: $(ls -lh bin/e2eprobe)"
 
       # ── Install k6 ─────────────────────────────────────────────────────────
       - name: Install k6
@@ -240,10 +242,10 @@ jobs:
         env:
           # CI defaults: 10 VUs with short stages to avoid OOM on 2-CPU/7.75GB runner.
           # Override via workflow_dispatch inputs for a real load run.
-          MAX_VUS:         ${{ github.event.inputs.max_vus        || '10' }}
-          RAMP_DURATION:   ${{ github.event.inputs.ramp_duration  || '10s' }}
+          MAX_VUS: ${{ github.event.inputs.max_vus        || '10' }}
+          RAMP_DURATION: ${{ github.event.inputs.ramp_duration  || '10s' }}
           STABLE_DURATION: ${{ github.event.inputs.stable_duration || '30s' }}
-          CHUNK_MS:        ${{ github.event.inputs.chunk_ms       || '20' }}
+          CHUNK_MS: ${{ github.event.inputs.chunk_ms       || '20' }}
         run: |
           bash run_pipeline.sh \
             --k6-only \

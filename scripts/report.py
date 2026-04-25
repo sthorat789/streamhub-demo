@@ -86,8 +86,10 @@ def k6_rows(summary: dict) -> list[dict]:
             (t.get("ok", True) if isinstance(t, dict) else bool(t))
             for t in thresholds.values()
         )
+        def thr_pass(t):
+            return t.get("ok", True) if isinstance(t, dict) else bool(t)
         thr_str = " / ".join(
-            f"{'\u2713' if (t.get('ok') if isinstance(t, dict) else bool(t)) else '\u2717'} {expr}"
+            f"{'✓' if thr_pass(t) else '✗'} {expr}"
             for expr, t in thresholds.items()
         ) if thresholds else "—"
 
@@ -360,6 +362,7 @@ def build_e2e_table(summary: dict) -> str:
     if not summary:
         return "<p style='padding:20px;color:#aaa'>No native e2e summary found.</p>"
     rows = [
+        ("Bridge latency p95", f"{summary.get('bridge_latency_p95_ms', 0):.3f} ms", "—"),
         ("E2E latency p95", f"{summary.get('e2e_latency_p95_ms', 0):.2f} ms", "✓ p95<500ms" if summary.get('thresholds', {}).get('e2e_latency_p95_lt_500ms') else "✗ p95<500ms"),
         ("Session success rate", f"{summary.get('sess_ok_rate', 0)*100:.1f}%", "✓ rate>95%" if summary.get('thresholds', {}).get('sess_ok_rate_gt_095') else "✗ rate>95%"),
         ("Avg drop %", f"{summary.get('sess_drop_pct_avg', 0):.2f}%", "✓ avg<1%" if summary.get('thresholds', {}).get('sess_drop_pct_avg_lt_1') else "✗ avg<1%"),

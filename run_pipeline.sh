@@ -156,6 +156,18 @@ if [[ "$K6_ONLY" == false ]]; then
   go build -o bin/streamhub  ./cmd/streamhub
   echo "    Built: bin/bridge  bin/e2eprobe  bin/streamhub"
   cd "$SCRIPT_DIR"
+elif [[ ! -x "$GO_DIR/bin/e2eprobe" ]]; then
+  echo "==> Building missing e2eprobe binary for --k6-only run..."
+  cd "$GO_DIR"
+  if [[ ! -f pb/audio_forward.pb.go ]] || \
+     [[ pb/audio_forward.pb.go -ot "$SCRIPT_DIR/proto/audio_forward.proto" ]]; then
+    echo "    Generating proto stubs..."
+    bash generate_proto.sh
+  fi
+  go mod tidy -e
+  go build -o bin/e2eprobe ./cmd/e2eprobe
+  echo "    Built: bin/e2eprobe"
+  cd "$SCRIPT_DIR"
 fi
 
 # ─── Start services ────────────────────────────────────────────────────────────
