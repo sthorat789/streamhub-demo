@@ -290,6 +290,17 @@ jobs:
           if [[ -n "$INNER_LATEST" && "$INNER_LATEST" != "$RESULTS_DIR" ]]; then
             cp -r "$INNER_LATEST/"* "$RESULTS_DIR/" 2>/dev/null || true
           fi
+          # run_pipeline.sh generates report.html using its own timestamped RESULTS_DIR,
+          # which does not contain e2e_latency.json (Bridge wrote it to $RESULTS_DIR).
+          # Now that all files are co-located in $RESULTS_DIR, regenerate the report.
+          K6_ARG=""
+          [[ -f "$RESULTS_DIR/k6_summary.json" ]] && K6_ARG="--k6-summary $RESULTS_DIR/k6_summary.json"
+          QUALITY_ARG=""
+          [[ -s "$RESULTS_DIR/quality.json" ]] && QUALITY_ARG="--quality $RESULTS_DIR/quality.json"
+          E2E_ARG=""
+          [[ -f "$RESULTS_DIR/e2e_latency.json" ]] && E2E_ARG="--e2e-summary $RESULTS_DIR/e2e_latency.json"
+          # shellcheck disable=SC2086
+          python3 scripts/report.py $K6_ARG $QUALITY_ARG $E2E_ARG --out "$RESULTS_DIR/report.html" || true
 
       # ── Capture container logs for diagnostics ────────────────────────────
       - name: Capture StreamHub logs
