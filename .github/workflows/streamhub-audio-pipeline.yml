@@ -154,15 +154,13 @@ jobs:
           go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
           go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.4.0
 
-      - name: Generate proto stubs + build Bridge + e2eprobe
+      - name: Generate proto stubs + build Bridge
         working-directory: go
         run: |
           bash generate_proto.sh
           go mod tidy
           go build -o bin/bridge ./cmd/bridge
-          go build -o bin/e2eprobe ./cmd/e2eprobe
           echo "Bridge binary: $(ls -lh bin/bridge)"
-          echo "E2E probe binary: $(ls -lh bin/e2eprobe)"
 
       # ── Install k6 ─────────────────────────────────────────────────────────
       - name: Install k6
@@ -183,17 +181,46 @@ jobs:
       # ── Create runtime directories ─────────────────────────────────────────
       - name: Create runtime directories
         run: |
-          mkdir -p recordings
-          mkdir -p results
+          # One timestamped folder per CI run — everything lands here.
+          RESULTS_DIR="results/$(date -u +%Y%m%d_%H%M%S)"
+          mkdir -p recordings "$RESULTS_DIR"
+          # Expose to all subsequent steps in this job.
+          echo "RESULTS_DIR=$RESULTS_DIR" >> "$GITHUB_ENV"
+          echo "Results dir: $RESULTS_DIR"
 
       # ── Start Bridge (plain binary, with recording enabled) ────────────────
       - name: Start Bridge
         run: |
+          EXPECTED_PKTS=$(WAV="data/best_16k.wav" CHUNK_MS="${CHUNK_MS:-20}" python3 - <<'PYEOF'
+          import struct, sys, math, os
+          wav      = os.environ["WAV"]
+          chunk_ms = int(os.environ["CHUNK_MS"])
+          with open(wav, "rb") as f:
+              data = f.read()
+          pos = 12
+          while pos + 8 <= len(data):
+              tag = data[pos:pos+4]
+              sz  = struct.unpack_from("<I", data, pos+4)[0]
+              if tag == b"data":
+                  sr       = struct.unpack_from("<I", data, 24)[0]
+                  bits     = struct.unpack_from("<H", data, 34)[0]
+                  channels = struct.unpack_from("<H", data, 22)[0]
+                  bpms     = sr * (bits // 8) * channels
+                  chunk_b  = max(1, (bpms * chunk_ms) // 1000)
+                  print(math.ceil(sz / chunk_b))
+                  sys.exit(0)
+              pos += 8 + sz + (sz % 2)
+          print(0)
+          PYEOF
+          )
+          echo "Expected packets/session: $EXPECTED_PKTS"
           go/bin/bridge \
             --port=50052 \
-            --record-dir=recordings &
+            --record-dir=recordings \
+            --stats-out="$RESULTS_DIR/e2e_latency.json" \
+            --expected-packets="$EXPECTED_PKTS" &
           echo "BRIDGE_PID=$!" >> "$GITHUB_ENV"
-          echo "Bridge started (PID $!)"
+          echo "Bridge started (PID $!) expected_pkts=$EXPECTED_PKTS"
 
       # ── Build StreamHub image locally using GHA layer cache ─────────────────
       # Avoids pulling from GHCR (private package auth / network timeout issues).
@@ -257,11 +284,28 @@ jobs:
             --audio=data/best_16k.wav
           # Note: run_pipeline.sh converts AUDIO_FILE to an absolute path before
           # passing it to k6, so k6's open() (script-relative) receives a full path.
+          # Copy run_pipeline.sh's own timestamped results into RESULTS_DIR so the
+          # Bridge stats, quality JSON and report are all in one place.
+          INNER_LATEST=$(readlink -f results/latest 2>/dev/null || echo "")
+          if [[ -n "$INNER_LATEST" && "$INNER_LATEST" != "$RESULTS_DIR" ]]; then
+            cp -r "$INNER_LATEST/"* "$RESULTS_DIR/" 2>/dev/null || true
+          fi
+          # run_pipeline.sh generates report.html using its own timestamped RESULTS_DIR,
+          # which does not contain e2e_latency.json (Bridge wrote it to $RESULTS_DIR).
+          # Now that all files are co-located in $RESULTS_DIR, regenerate the report.
+          K6_ARG=""
+          [[ -f "$RESULTS_DIR/k6_summary.json" ]] && K6_ARG="--k6-summary $RESULTS_DIR/k6_summary.json"
+          QUALITY_ARG=""
+          [[ -s "$RESULTS_DIR/quality.json" ]] && QUALITY_ARG="--quality $RESULTS_DIR/quality.json"
+          E2E_ARG=""
+          [[ -f "$RESULTS_DIR/e2e_latency.json" ]] && E2E_ARG="--e2e-summary $RESULTS_DIR/e2e_latency.json"
+          # shellcheck disable=SC2086
+          python3 scripts/report.py $K6_ARG $QUALITY_ARG $E2E_ARG --out "$RESULTS_DIR/report.html" || true
 
       # ── Capture container logs for diagnostics ────────────────────────────
       - name: Capture StreamHub logs
         if: always()
-        run: docker logs streamhub 2>&1 | tee results/streamhub.log || true
+        run: docker logs streamhub 2>&1 | tee "$RESULTS_DIR/streamhub.log" || true
 
       # ── Teardown ──────────────────────────────────────────────────────────
       - name: Stop services
@@ -277,6 +321,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: streamhub-pipeline-${{ github.run_number }}-${{ github.run_attempt }}
-          path: results/
+          path: ${{ env.RESULTS_DIR }}/
           retention-days: 30
           if-no-files-found: warn

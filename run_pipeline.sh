@@ -141,6 +141,32 @@ if [[ ! -f "$SCRIPT_DIR/$AUDIO_FILE" ]]; then
   echo "ERROR: Audio file not found: $SCRIPT_DIR/$AUDIO_FILE"; exit 1
 fi
 
+# Compute expected packets per session from WAV header (data_size / chunk_bytes).
+# Bridge uses this to calculate drop % and mark sessions OK/FAIL.
+EXPECTED_PKTS=$(WAV="$SCRIPT_DIR/$AUDIO_FILE" CHUNK_MS="$CHUNK_MS" python3 - <<'PYEOF'
+import struct, sys, math, os
+wav      = os.environ["WAV"]
+chunk_ms = int(os.environ["CHUNK_MS"])
+with open(wav, "rb") as f:
+    data = f.read()
+pos = 12
+while pos + 8 <= len(data):
+    tag = data[pos:pos+4]
+    sz  = struct.unpack_from("<I", data, pos+4)[0]
+    if tag == b"data":
+        sr       = struct.unpack_from("<I", data, 24)[0]
+        bits     = struct.unpack_from("<H", data, 34)[0]
+        channels = struct.unpack_from("<H", data, 22)[0]
+        bpms     = sr * (bits // 8) * channels
+        chunk_b  = max(1, (bpms * chunk_ms) // 1000)
+        print(math.ceil(sz / chunk_b))
+        sys.exit(0)
+    pos += 8 + sz + (sz % 2)
+print(0)
+PYEOF
+)
+echo "    Expected packets/session: $EXPECTED_PKTS  (chunk_ms=$CHUNK_MS)"
+
 # ─── Build ─────────────────────────────────────────────────────────────────────
 if [[ "$K6_ONLY" == false ]]; then
   echo "==> Building Go binaries..."
@@ -152,28 +178,15 @@ if [[ "$K6_ONLY" == false ]]; then
   fi
   go mod tidy -e
   go build -o bin/bridge     ./cmd/bridge
-  go build -o bin/e2eprobe   ./cmd/e2eprobe
   go build -o bin/streamhub  ./cmd/streamhub
-  echo "    Built: bin/bridge  bin/e2eprobe  bin/streamhub"
-  cd "$SCRIPT_DIR"
-elif [[ ! -x "$GO_DIR/bin/e2eprobe" ]]; then
-  echo "==> Building missing e2eprobe binary for --k6-only run..."
-  cd "$GO_DIR"
-  if [[ ! -f pb/audio_forward.pb.go ]] || \
-     [[ pb/audio_forward.pb.go -ot "$SCRIPT_DIR/proto/audio_forward.proto" ]]; then
-    echo "    Generating proto stubs..."
-    bash generate_proto.sh
-  fi
-  go mod tidy -e
-  go build -o bin/e2eprobe ./cmd/e2eprobe
-  echo "    Built: bin/e2eprobe"
+  echo "    Built: bin/bridge  bin/streamhub"
   cd "$SCRIPT_DIR"
 fi
 
 # ─── Start services ────────────────────────────────────────────────────────────
 if [[ "$K6_ONLY" == false ]]; then
   echo "==> Starting Bridge on :$BRIDGE_PORT..."
-  BRIDGE_ARGS=(--port="$BRIDGE_PORT")
+  BRIDGE_ARGS=(--port="$BRIDGE_PORT" --stats-out="$RESULTS_DIR/e2e_latency.json" --expected-packets="$EXPECTED_PKTS")
   if [[ -n "$RECORD_DIR" ]]; then
     mkdir -p "$RECORD_DIR"
     BRIDGE_ARGS+=(--record-dir="$RECORD_DIR")
@@ -193,19 +206,6 @@ fi
 
 # ─── k6 ────────────────────────────────────────────────────────────────────────
 if [[ "$NO_K6" == false ]]; then
-  echo ""
-  echo "==> Starting native e2e latency probe..."
-  "$GO_DIR/bin/e2eprobe" \
-    --bridge-addr="127.0.0.1:$BRIDGE_PORT" \
-    --wait-s="$WAIT_S" \
-    --session-count="$MAX_VUS" \
-    --audio-file="$SCRIPT_DIR/$AUDIO_FILE" \
-    --chunk-ms="$CHUNK_MS" \
-    --out "$RESULTS_DIR/e2e_latency.json" \
-    > "$RESULTS_DIR/e2eprobe.log" 2>&1 &
-  E2E_PROBE_PID=$!
-  PIDS+=($E2E_PROBE_PID)
-
   echo "==> Running k6  max_vus=$MAX_VUS  ramp=$RAMP_DURATION  stable=$STABLE_DURATION  chunk_ms=$CHUNK_MS  audio=$AUDIO_FILE"
   echo "──────────────────────────────────────────────────────────────────"
   cd "$SCRIPT_DIR"
@@ -213,23 +213,26 @@ if [[ "$NO_K6" == false ]]; then
   # Pass an absolute path so it works regardless of where k6 is invoked from.
   K6_AUDIO_FILE="$SCRIPT_DIR/$AUDIO_FILE"
   k6 run \
-    --summary-export "$RESULTS_DIR/k6_summary.json" \
+    --env SUMMARY_FILE="$RESULTS_DIR/k6_summary.json" \
     --env WS_URL="ws://127.0.0.1:$WS_PORT" \
-    --env BRIDGE_GRPC_ADDR="127.0.0.1:$BRIDGE_PORT" \
     --env AUDIO_FILE="$K6_AUDIO_FILE" \
     --env CHUNK_MS="$CHUNK_MS" \
     --env MAX_VUS="$MAX_VUS" \
     --env RAMP_DURATION="$RAMP_DURATION" \
     --env STABLE_DURATION="$STABLE_DURATION" \
-    --env WAIT_S="$WAIT_S" \
     tests/k6/k6_audio_pipeline.js
   echo ""
 
-  E2E_PROBE_STATUS=0
-  wait "$E2E_PROBE_PID" || E2E_PROBE_STATUS=$?
-  echo "==> E2E probe log"
-  cat "$RESULTS_DIR/e2eprobe.log" || true
-  echo ""
+  # In --k6-only mode Bridge is started externally (e.g. by CI).
+  # If CI already wrote stats directly into RESULTS_DIR (via --stats-out=$RESULTS_DIR/...)
+  # nothing to do.  Fallback: copy from the flat results/ root for older callers.
+  if [[ "$K6_ONLY" == true && ! -f "$RESULTS_DIR/e2e_latency.json" ]]; then
+    BRIDGE_STATS="$SCRIPT_DIR/results/e2e_latency.json"
+    if [[ -f "$BRIDGE_STATS" ]]; then
+      cp "$BRIDGE_STATS" "$RESULTS_DIR/e2e_latency.json"
+    fi
+  fi
+
 
   # ── Quality check ───────────────────────────────────────────────────────────
   if [[ -n "$RECORD_DIR" ]]; then
@@ -267,10 +270,6 @@ if [[ "$NO_K6" == false ]]; then
     $QUALITY_ARG \
     --e2e-summary "$RESULTS_DIR/e2e_latency.json" \
     --out "$RESULTS_DIR/report.html"
-
-  if [[ "$E2E_PROBE_STATUS" -ne 0 ]]; then
-    exit "$E2E_PROBE_STATUS"
-  fi
 
 else
   echo ""

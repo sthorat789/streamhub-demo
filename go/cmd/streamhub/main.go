@@ -1,17 +1,13 @@
 // cmd/streamhub/main.go — StreamHub
 //
 // Receives raw PCM audio from k6 sender over WebSocket and forwards every
-// packet to the Bridge over gRPC (PushAudio client-streaming).
+// binary frame to the Bridge over gRPC (PushAudio client-streaming) unchanged.
 //
-// StreamHub is a WebSocket SERVER and a gRPC CLIENT only.
-// It has NO gRPC server — the Bridge owns all gRPC serving.
+// StreamHub is a pure passthrough: it does NOT inspect or modify the payload.
+// Timestamp extraction and e2e latency computation are done entirely by Bridge.
 //
-//   k6 sender  ──(WS binary)──────────────────► StreamHub :8765
-//   StreamHub  ──(gRPC PushAudio)──────────────► Bridge :50052
-//   k6 receiver ◄──(gRPC ReceiveAudio)────────── Bridge :50052
-//
-// One goroutine per WS connection dials Bridge and opens a PushAudio stream.
-// Packets flow: WS message → AudioPacket → PushAudio.Send → Bridge.
+//   k6 sender ──(WS binary with K6TS header)──► StreamHub :8765
+//   StreamHub ──(gRPC PushAudio, raw payload)──► Bridge    :50052
 //
 // Usage:
 //   go run ./cmd/streamhub
@@ -19,20 +15,15 @@
 //
 // Build:
 //   go build -o bin/streamhub ./cmd/streamhub
-//
-// Setup (once):
-//   cd go && bash generate_proto.sh && go mod tidy
 
 package main
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"log"
 	"net/http"
-	"time"
 
 	"github.com/gorilla/websocket"
 	"google.golang.org/grpc"
@@ -55,8 +46,6 @@ type metadata struct {
 	Channels   uint32 `json:"channels"`
 	ChunkMS    uint32 `json:"chunk_ms"`
 }
-
-var clientTsMagic = [4]byte{'K', '6', 'T', 'S'}
 
 // ─── Per-connection handler ────────────────────────────────────────────────────
 // Each WS connection gets its own goroutine, its own gRPC connection, and its
@@ -122,24 +111,13 @@ func handleWS(bridgeAddr string, w http.ResponseWriter, r *http.Request) {
 			continue // skip non-binary (e.g. ping frames)
 		}
 
-		clientSendTsUs := int64(0)
-		if len(data) >= 12 &&
-			data[0] == clientTsMagic[0] &&
-			data[1] == clientTsMagic[1] &&
-			data[2] == clientTsMagic[2] &&
-			data[3] == clientTsMagic[3] {
-			clientSendTsUs = int64(binary.LittleEndian.Uint64(data[4:12]))
-			data = data[12:]
-		}
-
+		// Forward the raw WS frame as-is — Bridge extracts any K6TS header.
 		pkt := &pb.AudioPacket{
-			Seq:            seq,
-			SendTsUs:       time.Now().UnixMicro(),
-			SessionId:      sid,
-			SampleRate:     meta.SampleRate,
-			Channels:       meta.Channels,
-			Payload:        append([]byte(nil), data...), // copy — WS reuses buf
-			ClientSendTsUs: clientSendTsUs,
+			Seq:        seq,
+			SessionId:  sid,
+			SampleRate: meta.SampleRate,
+			Channels:   meta.Channels,
+			Payload:    append([]byte(nil), data...), // copy — WS reuses buf
 		}
 		seq++
 
@@ -171,7 +149,7 @@ func shortID(s string) string {
 // ─── main ──────────────────────────────────────────────────────────────────────
 
 func main() {
-	wsPort     := flag.String("ws-port",     "8765",            "WebSocket listen port")
+	wsPort := flag.String("ws-port", "8765", "WebSocket listen port")
 	bridgeAddr := flag.String("bridge-addr", "127.0.0.1:50052", "Bridge gRPC address (host:port)")
 	flag.Parse()
 

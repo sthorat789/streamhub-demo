@@ -23,21 +23,39 @@ from datetime import datetime, timezone
 
 # ─── k6 summary parsing ────────────────────────────────────────────────────────
 
+# (label, one-line explanation shown in report)
 METRIC_LABELS = {
-    "fwd_bridge_latency_ms": "Bridge latency",
-    "fwd_sess_lat_mean_ms":  "Session lat mean",
-    "fwd_sess_lat_p50_ms":   "Session lat p50",
-    "fwd_sess_lat_p95_ms":   "Session lat p95",
-    "fwd_sess_lat_p99_ms":   "Session lat p99",
-    "fwd_sess_jitter_ms":    "Jitter",
-    "fwd_sess_buf_delay_ms": "Buffer delay (p95−p50)",
-    "fwd_sess_mos":          "MOS score",
-    "fwd_sess_drop_pct":     "Drop %",
-    "fwd_ws_conn_ms":        "WS connect time",
-    "fwd_sess_ok":           "Session success rate",
-    "fwd_pkts_expected":     "Packets expected",
-    "fwd_pkts_received":     "Packets received",
-    "fwd_pkts_dropped":      "Packets dropped",
+    # ── Custom metrics emitted by k6 script ──────────────────────────────────
+    "fwd_ws_conn_ms":      ("WS connect time",
+                            "Time from ws.connect() call to socket open event (custom Trend)."),
+    "fwd_ws_ok":           ("Session success rate",
+                            "% of VU iterations that received HTTP 101 (WebSocket upgrade OK)."),
+    # ── Check assertions ─────────────────────────────────────────────────────
+    "checks":              ("Check pass rate",
+                            "Rate of check() assertions that passed across all VUs and iterations."),
+    # ── Execution ─────────────────────────────────────────────────────────────
+    "iteration_duration":  ("Iteration duration",
+                            "Wall-clock time for one complete VU iteration: WS connect → stream full WAV → close."),
+    "iterations":          ("Iterations completed",
+                            "Total number of fully completed VU iterations (= sessions that ran to end)."),
+    "vus":                 ("Active VUs",
+                            "Number of concurrent virtual users active at end-of-test snapshot."),
+    "vus_max":             ("Max VUs",
+                            "Peak concurrent virtual users observed during the test run."),
+    # ── Network ───────────────────────────────────────────────────────────────
+    "data_sent":           ("Data sent",
+                            "Total bytes sent by k6 over all WebSocket connections (audio chunks + metadata)."),
+    "data_received":       ("Data received",
+                            "Total bytes received by k6 (WebSocket close frames and control messages)."),
+    # ── WebSocket ─────────────────────────────────────────────────────────────
+    "ws_connecting":       ("WS TCP handshake",
+                            "Time to complete TCP connection + HTTP upgrade before the socket open event."),
+    "ws_msgs_sent":        ("WS frames sent",
+                            "Total binary + text frames sent; each binary frame is one 20 ms audio chunk."),
+    "ws_session_duration": ("WS session duration",
+                            "Wall-clock time the WebSocket socket was open (open event → close event)."),
+    "ws_sessions":         ("WS sessions opened",
+                            "Total WebSocket sessions opened; equals iterations when one session per VU iteration."),
 }
 
 
@@ -74,55 +92,106 @@ def fmt_val(v, decimals=2):
     return str(v)
 
 
+def fmt_ms(v) -> str:
+    """Format a k6 timing value (stored in ms) as human-readable string."""
+    if v is None:
+        return "—"
+    v = float(v)
+    if v >= 60_000:
+        return f"{v/60_000:.1f} min"
+    if v >= 1_000:
+        return f"{v/1_000:.2f} s"
+    if v >= 1:
+        return f"{v:.2f} ms"
+    return f"{v*1000:.0f} µs"
+
+
+def fmt_bytes(v) -> str:
+    """Format a byte count as human-readable string."""
+    if v is None:
+        return "—"
+    v = float(v)
+    for unit, divisor in [("GB", 1e9), ("MB", 1e6), ("kB", 1e3)]:
+        if v >= divisor:
+            return f"{v/divisor:.2f} {unit}"
+    return f"{v:.0f} B"
+
+
 def k6_rows(summary: dict) -> list[dict]:
     rows = []
-    for key, label in METRIC_LABELS.items():
+    for key, (label, explain) in METRIC_LABELS.items():
         m = summary.get("metrics", {}).get(key)
         if not m:
             continue
-        vals = m.get("values", {})
+        vals      = m.get("values", {})
         thresholds = m.get("thresholds", {})
-        thr_ok = all(
-            (t.get("ok", True) if isinstance(t, dict) else bool(t))
-            for t in thresholds.values()
-        )
+        is_time   = m.get("contains") == "time"
+
         def thr_pass(t):
             return t.get("ok", True) if isinstance(t, dict) else bool(t)
+
+        thr_ok  = all(thr_pass(t) for t in thresholds.values())
         thr_str = " / ".join(
             f"{'✓' if thr_pass(t) else '✗'} {expr}"
             for expr, t in thresholds.items()
         ) if thresholds else "—"
 
+        fv    = fmt_ms if is_time else fmt_val
         mtype = m.get("type", "")
+
         if mtype == "trend":
             rows.append({
-                "label": label,
-                "avg":   fmt_val(vals.get("avg")),
-                "p50":   fmt_val(vals.get("med")),
-                "p95":   fmt_val(vals.get("p(95)")),
-                "p99":   fmt_val(vals.get("p(99)")),
+                "label":     label,
+                "explain":   explain,
+                "avg":       fv(vals.get("avg")),
+                "p50":       fv(vals.get("med")),
+                "p95":       fv(vals.get("p(95)")),
+                "p99":       fv(vals.get("p(99)")),
                 "threshold": thr_str,
-                "ok": thr_ok,
+                "ok":        thr_ok,
             })
         elif mtype == "rate":
+            passes = int(vals.get("passes", 0))
+            fails  = int(vals.get("fails",  0))
             rows.append({
-                "label": label,
-                "avg":   fmt_val(vals.get("rate", 0) * 100, 1) + "%",
-                "p50":   "—",
-                "p95":   "—",
-                "p99":   "—",
+                "label":     label,
+                "explain":   explain,
+                "avg":       fmt_val(vals.get("rate", 0) * 100, 1) + "%",
+                "p50":       f"{passes} passed",
+                "p95":       f"{fails} failed",
+                "p99":       "—",
                 "threshold": thr_str,
-                "ok": thr_ok,
+                "ok":        thr_ok,
             })
         elif mtype == "counter":
+            count = int(vals.get("count", 0))
+            rate  = vals.get("rate", 0)
+            if key in ("data_sent", "data_received"):
+                avg_str = fmt_bytes(count)
+                p50_str = fmt_bytes(rate) + "/s"
+            else:
+                avg_str = str(count)
+                p50_str = f"{rate:.3f}/s"
             rows.append({
-                "label": label,
-                "avg":   str(int(vals.get("count", 0))),
-                "p50":   "—",
-                "p95":   "—",
-                "p99":   "—",
+                "label":     label,
+                "explain":   explain,
+                "avg":       avg_str,
+                "p50":       p50_str,
+                "p95":       "—",
+                "p99":       "—",
                 "threshold": thr_str,
-                "ok": thr_ok,
+                "ok":        thr_ok,
+            })
+        elif mtype == "gauge":
+            rows.append({
+                "label":     label,
+                "explain":   explain,
+                "avg":       fmt_val(vals.get("value")),
+                "p50":       fmt_val(vals.get("min")),
+                "p95":       fmt_val(vals.get("max")),
+                "p99":       "—",
+                "threshold": thr_str,
+                "ok":        thr_ok,
             })
     return rows
 
@@ -154,12 +223,11 @@ def quality_all_pass(results: list[dict]) -> bool:
 
 def latency_chart_data(summary: dict) -> str:
     labels, avg_vals, p95_vals = [], [], []
+    # Only include sub-second timing metrics; session/iteration duration are minutes-scale
+    # and would dwarf the WS handshake values on the same chart axis.
     trend_keys = [
-        ("fwd_bridge_latency_ms", "Bridge latency"),
-        ("fwd_sess_lat_p50_ms",   "Sess p50"),
-        ("fwd_sess_lat_p95_ms",   "Sess p95"),
-        ("fwd_sess_jitter_ms",    "Jitter"),
-        ("fwd_sess_buf_delay_ms", "Buf delay"),
+        ("fwd_ws_conn_ms", "WS connect (custom)"),
+        ("ws_connecting",  "WS TCP handshake"),
     ]
     for key, label in trend_keys:
         m = summary.get("metrics", {}).get(key)
@@ -247,9 +315,9 @@ HTML_TEMPLATE = """\
     {k6_table}
   </div>
 
-    <!-- Native e2e metrics -->
+    <!-- StreamHub e2e metrics -->
     <div class="section">
-        <div class="section-header">Native End-To-End Metrics</div>
+        <div class="section-header">StreamHub E2E Metrics</div>
         {e2e_table}
     </div>
 
@@ -299,15 +367,25 @@ def stat_card(val: str, label: str) -> str:
 def build_k6_table(rows: list[dict]) -> str:
     if not rows:
         return "<p style='padding:20px;color:#aaa'>No k6 summary data found.</p>"
+    # Column headers are generic because different metric types use columns differently:
+    # Trend → avg | med | p95 | p99 ;  Rate → rate% | passes | fails | — ;
+    # Counter → count | rate/s | — | — ;  Gauge → value | min | max | —
     hdr = ("<thead><tr>"
-           "<th>Metric</th><th>avg</th><th>p50</th><th>p95</th><th>p99</th><th>Threshold</th>"
+           "<th>Metric</th>"
+           "<th title='Trend: avg; Rate: pass rate; Counter: total count; Gauge: current value'>Avg / Value</th>"
+           "<th title='Trend: median; Rate: # passed; Counter: rate/s; Gauge: min'>Med / Min</th>"
+           "<th title='Trend: 95th-pct; Rate: # failed; Gauge: max'>p95 / Max</th>"
+           "<th>p99</th>"
+           "<th>Threshold</th>"
            "</tr></thead>")
     body = "<tbody>"
     for r in rows:
-        ok_cls = "ok" if r["ok"] else "fail"
+        ok_cls  = "ok" if r["ok"] else "fail"
+        explain = r.get("explain", "")
+        sub     = f"<br><small style='color:#999;font-weight:400;font-size:11px'>{explain}</small>" if explain else ""
         body += (
             f"<tr>"
-            f"<td>{r['label']}</td>"
+            f"<td><strong>{r['label']}</strong>{sub}</td>"
             f"<td>{r['avg']}</td>"
             f"<td>{r['p50']}</td>"
             f"<td>{r['p95']}</td>"
@@ -370,20 +448,70 @@ def build_chart_section(chart_data: str) -> str:
 
 def build_e2e_table(summary: dict) -> str:
     if not summary:
-        return "<p style='padding:20px;color:#aaa'>No native e2e summary found.</p>"
+        return "<p style='padding:20px;color:#aaa'>No e2e summary found.</p>"
+    thresholds = summary.get("thresholds", {})
     rows = [
-        ("Bridge latency p95", f"{summary.get('bridge_latency_p95_ms', 0):.3f} ms", "—"),
-        ("E2E latency p95", f"{summary.get('e2e_latency_p95_ms', 0):.2f} ms", "✓ p95<500ms" if summary.get('thresholds', {}).get('e2e_latency_p95_lt_500ms') else "✗ p95<500ms"),
-        ("Session success rate", f"{summary.get('sess_ok_rate', 0)*100:.1f}%", "✓ rate>95%" if summary.get('thresholds', {}).get('sess_ok_rate_gt_095') else "✗ rate>95%"),
-        ("Avg drop %", f"{summary.get('sess_drop_pct_avg', 0):.2f}%", "✓ avg<1%" if summary.get('thresholds', {}).get('sess_drop_pct_avg_lt_1') else "✗ avg<1%"),
-        ("Expected packets/session", str(int(summary.get('expected_packets', 0))), "—"),
-        ("Sessions probed", str(int(summary.get('session_count', 0))), "—"),
+        (
+            "E2E latency p95",
+            f"{summary.get('e2e_latency_p95_ms', 0):.2f} ms",
+            "✓ p95<500ms" if thresholds.get("e2e_latency_p95_lt_500ms") else "✗ p95<500ms",
+            "95th-percentile of (Bridge receive time − k6 send timestamp). "
+            "Measures the full pipeline: k6 → WS → StreamHub → gRPC → Bridge. "
+            "Unbiased only when k6 and Bridge share the same host/clock (CI default); "
+            "in multi-host setups clock skew directly biases the reported value.",
+        ),
+        (
+            "Session success rate",
+            f"{summary.get('sess_ok_rate', 0)*100:.1f}%",
+            "✓ rate>95%" if thresholds.get("sess_ok_rate_gt_095") else "✗ rate>95%",
+            "Fraction of sessions marked OK by Bridge (packet loss below threshold, no fatal errors).",
+        ),
+        (
+            "Avg packet drop %",
+            f"{summary.get('sess_drop_pct_avg', 0):.2f}%",
+            "✓ avg<1%" if thresholds.get("sess_drop_pct_avg_lt_1") else "✗ avg<1%",
+            "Average drop rate across sessions: (expected − received) / expected × 100. "
+            "Packets are counted at Bridge receive side.",
+        ),
+        (
+            "Jitter avg (RFC 3550)",
+            f"{summary.get('jitter_avg_ms', 0):.3f} ms",
+            "—",
+            "Smoothed inter-packet delay variation per session, averaged across all sessions. "
+            "Formula: J += (|Δtransit| − J) / 16 — same as RTP jitter estimation (RFC 3550 §6.4.1).",
+        ),
+        (
+            "Drift avg (last − first 5)",
+            f"{summary.get('drift_avg_ms', 0):+.2f} ms",
+            "—",
+            "mean(last-5 latencies) − mean(first-5 latencies) per session, averaged across all sessions. "
+            "Positive = pipeline accumulating delay over time (backpressure / buffer growth).",
+        ),
+        (
+            "Expected packets / session",
+            str(int(summary.get("expected_packets", 0))),
+            "—",
+            "Packets expected per session = WAV data size ÷ chunk size. Used to compute drop %.",
+        ),
+        (
+            "Sessions probed",
+            str(int(summary.get("session_count", 0))),
+            "—",
+            "Unique session IDs received by Bridge in this run.",
+        ),
     ]
     hdr = "<thead><tr><th>Metric</th><th>Value</th><th>Threshold</th></tr></thead>"
     body = "<tbody>"
-    for label, value, threshold in rows:
+    for label, value, threshold, explain in rows:
         cls = "ok" if threshold.startswith("✓") or threshold == "—" else "fail"
-        body += f"<tr><td>{label}</td><td>{value}</td><td class='{cls} mono'>{threshold}</td></tr>"
+        sub = f"<br><small style='color:#999;font-weight:400;font-size:11px'>{explain}</small>"
+        body += (
+            f"<tr>"
+            f"<td><strong>{label}</strong>{sub}</td>"
+            f"<td>{value}</td>"
+            f"<td class='{cls} mono'>{threshold}</td>"
+            f"</tr>"
+        )
     body += "</tbody>"
     return f"<table>{hdr}{body}</table>"
 
