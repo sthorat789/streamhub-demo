@@ -143,10 +143,10 @@ fi
 
 # Compute expected packets per session from WAV header (data_size / chunk_bytes).
 # Bridge uses this to calculate drop % and mark sessions OK/FAIL.
-EXPECTED_PKTS=$(python3 - <<'PYEOF'
-import struct, sys, math
-wav = "$SCRIPT_DIR/$AUDIO_FILE"
-chunk_ms = $CHUNK_MS
+EXPECTED_PKTS=$(WAV="$SCRIPT_DIR/$AUDIO_FILE" CHUNK_MS="$CHUNK_MS" python3 - <<'PYEOF'
+import struct, sys, math, os
+wav      = os.environ["WAV"]
+chunk_ms = int(os.environ["CHUNK_MS"])
 with open(wav, "rb") as f:
     data = f.read()
 pos = 12
@@ -223,9 +223,10 @@ if [[ "$NO_K6" == false ]]; then
     tests/k6/k6_audio_pipeline.js
   echo ""
 
-  # In --k6-only mode Bridge is started externally (by CI) and writes its stats
-  # to a fixed path.  Copy into RESULTS_DIR so quality check and report find it.
-  if [[ "$K6_ONLY" == true ]]; then
+  # In --k6-only mode Bridge is started externally (e.g. by CI).
+  # If CI already wrote stats directly into RESULTS_DIR (via --stats-out=$RESULTS_DIR/...)
+  # nothing to do.  Fallback: copy from the flat results/ root for older callers.
+  if [[ "$K6_ONLY" == true && ! -f "$RESULTS_DIR/e2e_latency.json" ]]; then
     BRIDGE_STATS="$SCRIPT_DIR/results/e2e_latency.json"
     if [[ -f "$BRIDGE_STATS" ]]; then
       cp "$BRIDGE_STATS" "$RESULTS_DIR/e2e_latency.json"

@@ -181,15 +181,20 @@ jobs:
       # ── Create runtime directories ─────────────────────────────────────────
       - name: Create runtime directories
         run: |
-          mkdir -p recordings
-          mkdir -p results
+          # One timestamped folder per CI run — everything lands here.
+          RESULTS_DIR="results/$(date -u +%Y%m%d_%H%M%S)"
+          mkdir -p recordings "$RESULTS_DIR"
+          # Expose to all subsequent steps in this job.
+          echo "RESULTS_DIR=$RESULTS_DIR" >> "$GITHUB_ENV"
+          echo "Results dir: $RESULTS_DIR"
 
       # ── Start Bridge (plain binary, with recording enabled) ────────────────
       - name: Start Bridge
         run: |
-          EXPECTED_PKTS=$(python3 - <<'PYEOF'
-          import struct, sys, math
-          wav, chunk_ms = "data/best_16k.wav", 20
+          EXPECTED_PKTS=$(WAV="data/best_16k.wav" CHUNK_MS="20" python3 - <<'PYEOF'
+          import struct, sys, math, os
+          wav      = os.environ["WAV"]
+          chunk_ms = int(os.environ["CHUNK_MS"])
           with open(wav, "rb") as f:
               data = f.read()
           pos = 12
@@ -212,7 +217,7 @@ jobs:
           go/bin/bridge \
             --port=50052 \
             --record-dir=recordings \
-            --stats-out=results/e2e_latency.json \
+            --stats-out="$RESULTS_DIR/e2e_latency.json" \
             --expected-packets="$EXPECTED_PKTS" &
           echo "BRIDGE_PID=$!" >> "$GITHUB_ENV"
           echo "Bridge started (PID $!) expected_pkts=$EXPECTED_PKTS"
@@ -279,11 +284,17 @@ jobs:
             --audio=data/best_16k.wav
           # Note: run_pipeline.sh converts AUDIO_FILE to an absolute path before
           # passing it to k6, so k6's open() (script-relative) receives a full path.
+          # Copy run_pipeline.sh's own timestamped results into RESULTS_DIR so the
+          # Bridge stats, quality JSON and report are all in one place.
+          INNER_LATEST=$(readlink -f results/latest 2>/dev/null || echo "")
+          if [[ -n "$INNER_LATEST" && "$INNER_LATEST" != "$RESULTS_DIR" ]]; then
+            cp -r "$INNER_LATEST/"* "$RESULTS_DIR/" 2>/dev/null || true
+          fi
 
       # ── Capture container logs for diagnostics ────────────────────────────
       - name: Capture StreamHub logs
         if: always()
-        run: docker logs streamhub 2>&1 | tee results/streamhub.log || true
+        run: docker logs streamhub 2>&1 | tee "$RESULTS_DIR/streamhub.log" || true
 
       # ── Teardown ──────────────────────────────────────────────────────────
       - name: Stop services
@@ -299,6 +310,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: streamhub-pipeline-${{ github.run_number }}-${{ github.run_attempt }}
-          path: results/
+          path: ${{ env.RESULTS_DIR }}/
           retention-days: 30
           if-no-files-found: warn
