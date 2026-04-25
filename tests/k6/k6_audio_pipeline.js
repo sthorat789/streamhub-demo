@@ -78,7 +78,7 @@ if (__VU === 0) {
     `  ${DURATION_S.toFixed(1)} s  chunk=${CHUNK_BYTES} B @ ${CHUNK_MS} ms` +
     `  expected_pkts=${EXPECTED_PKTS}`
   );
-  console.log(`gRPC receiver → ${BRIDGE_GRPC_ADDR}  WS sender → ${WS_URL}`);
+  console.log(`WS sender → ${WS_URL}  chunk=${CHUNK_BYTES} B @ ${CHUNK_MS} ms`);
 }
 
 // ─── Timing ────────────────────────────────────────────────────────────────────
@@ -86,9 +86,7 @@ if (__VU === 0) {
 const SESSION_LIFE_S = Math.ceil(DURATION_S + 30);
 
 // Ramp schedule — generated from MAX_VUS.
-// Shape: ramp to 20% → 50% → 100% (stable 3m) → 50% → 20% → 0.
-// Sender scenario starts SENDER_START_S seconds after receiver, so receiver
-// VUs are always registered before the matching sender VUs connect.
+// Shape: ramp to 20% → 50% → 100% (stable) → 50% → 20% → 0.
 function buildLoadStages(peak) {
   const p20 = Math.max(1, Math.round(peak * 0.20));
   const p50 = Math.max(1, Math.round(peak * 0.50));
