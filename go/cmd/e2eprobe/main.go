@@ -125,18 +125,21 @@ func runSession(stub pb.AudioForwardServiceClient, sid string, waitS uint32, tim
 	res := sessionResult{SessionID: sid}
 	deadline := time.Now().Add(timeout)
 
-	var stream pb.AudioForwardService_ReceiveAudioClient
-	var streamCancel context.CancelFunc
-	defer func() {
-		if streamCancel != nil {
-			streamCancel()
-		}
-	}()
+	latencies := make([]float64, 0, expectedPkts)
+	bridgeLatencies := make([]float64, 0, expectedPkts)
+
+	// receiveLoop retries the entire ReceiveAudio+Recv cycle.
+	// For gRPC server-streaming, stub.ReceiveAudio always returns (stream, nil)
+	// immediately. Bridge's "session not found" timeout surfaces via stream.Recv(),
+	// not via the initial call, so retries must wrap the Recv loop too.
+receiveLoop:
 	for {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			res.Error = fmt.Sprintf("session %s did not appear within %s", sid, timeout)
-			return res
+			if res.Error == "" {
+				res.Error = fmt.Sprintf("session %s did not appear within %s", sid, timeout)
+			}
+			break
 		}
 		attemptWait := waitS
 		remainingS := uint32(math.Ceil(remaining.Seconds()))
@@ -147,47 +150,56 @@ func runSession(stub pb.AudioForwardServiceClient, sid string, waitS uint32, tim
 			attemptWait = remainingS
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), remaining)
-		s, err := stub.ReceiveAudio(ctx, &pb.ReceiveRequest{SessionId: sid, WaitS: attemptWait})
-		if err == nil {
-			stream = s
-			streamCancel = cancel
-			break
-		}
-		cancel()
-		code := status.Code(err)
-		if code == codes.DeadlineExceeded || code == codes.NotFound {
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-		res.Error = err.Error()
-		return res
-	}
-
-	latencies := make([]float64, 0, expectedPkts)
-	bridgeLatencies := make([]float64, 0, expectedPkts)
-	for {
-		pkt, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
+		stream, err := stub.ReceiveAudio(ctx, &pb.ReceiveRequest{SessionId: sid, WaitS: attemptWait})
 		if err != nil {
+			cancel()
+			code := status.Code(err)
+			if code == codes.Unavailable {
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
 			res.Error = err.Error()
 			break
 		}
-		if len(pkt.Payload) == 0 {
-			res.CorruptPackets++
-		}
-		if pkt.SendTsUs != 0 && pkt.RecvTsUs != 0 {
-			bridgeMs := float64(pkt.RecvTsUs-pkt.SendTsUs) / 1000.0
-			if bridgeMs >= 0 && bridgeMs < 60000 {
-				bridgeLatencies = append(bridgeLatencies, bridgeMs)
+
+		// Read packets. If Bridge times out before the sender arrives it sends a
+		// DeadlineExceeded trailer — retry only when no data has been received yet.
+		sessionStarted := false
+		for {
+			pkt, err := stream.Recv()
+			if err == io.EOF {
+				cancel()
+				break receiveLoop // clean stream end
 			}
-		}
-		if pkt.ClientSendTsUs != 0 {
-			arrivalUs := time.Now().UnixMicro()
-			latMs := float64(arrivalUs-pkt.ClientSendTsUs) / 1000.0
-			if latMs >= 0 && latMs < 60000 {
-				latencies = append(latencies, latMs)
+			if err != nil {
+				cancel()
+				code := status.Code(err)
+				if !sessionStarted && (code == codes.DeadlineExceeded || code == codes.NotFound) {
+					// Bridge wait_s timed out before sender arrived — retry
+					time.Sleep(200 * time.Millisecond)
+					continue receiveLoop
+				}
+				if res.Error == "" {
+					res.Error = err.Error()
+				}
+				break receiveLoop
+			}
+			sessionStarted = true
+			if len(pkt.Payload) == 0 {
+				res.CorruptPackets++
+			}
+			if pkt.SendTsUs != 0 && pkt.RecvTsUs != 0 {
+				bridgeMs := float64(pkt.RecvTsUs-pkt.SendTsUs) / 1000.0
+				if bridgeMs >= 0 && bridgeMs < 60000 {
+					bridgeLatencies = append(bridgeLatencies, bridgeMs)
+				}
+			}
+			if pkt.ClientSendTsUs != 0 {
+				arrivalUs := time.Now().UnixMicro()
+				latMs := float64(arrivalUs-pkt.ClientSendTsUs) / 1000.0
+				if latMs >= 0 && latMs < 60000 {
+					latencies = append(latencies, latMs)
+				}
 			}
 		}
 	}
@@ -199,7 +211,7 @@ func runSession(stub pb.AudioForwardServiceClient, sid string, waitS uint32, tim
 			if res.Error == "" {
 				res.Error = fmt.Sprintf("session %s stats not available within %s", sid, timeout)
 			}
-			return res
+			break
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), minDuration(remaining, 3*time.Second))
 		s, err := stub.GetSessionStats(ctx, &pb.SessionStatsRequest{SessionId: sid})
@@ -216,10 +228,12 @@ func runSession(stub pb.AudioForwardServiceClient, sid string, waitS uint32, tim
 		if res.Error == "" {
 			res.Error = err.Error()
 		}
-		return res
+		break
 	}
-	res.PacketsReceived = stats.PacketsReceived
-	res.PacketsDropped = stats.PacketsDropped
+	if stats != nil {
+		res.PacketsReceived = stats.PacketsReceived
+		res.PacketsDropped = stats.PacketsDropped
+	}
 
 	sort.Float64s(latencies)
 	sort.Float64s(bridgeLatencies)
