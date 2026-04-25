@@ -58,7 +58,11 @@ type session struct {
 type sessionStats struct {
 	packetsReceived uint64
 	packetsDropped  uint64
-	latenciesMs     []float64
+	latencyAvgMs    float64 // pre-computed in PushAudio — no re-sort in flushStats
+	latencyP95Ms    float64
+	latencyMaxMs    float64
+	jitterMs        float64 // RFC 3550 smoothed IPDV at session end
+	driftMs         float64 // mean(last-5 latency) − mean(first-5 latency)
 }
 
 var (
@@ -90,12 +94,16 @@ func remove(id string) {
 	mu.Unlock()
 }
 
-func storeStats(id string, received, dropped uint64, latencies []float64) {
+func storeStats(id string, received, dropped uint64, latAvgMs, latP95Ms, latMaxMs, jitterMs, driftMs float64) {
 	mu.Lock()
 	completed[id] = sessionStats{
 		packetsReceived: received,
 		packetsDropped:  dropped,
-		latenciesMs:     latencies,
+		latencyAvgMs:    latAvgMs,
+		latencyP95Ms:    latP95Ms,
+		latencyMaxMs:    latMaxMs,
+		jitterMs:        jitterMs,
+		driftMs:         driftMs,
 	}
 	mu.Unlock()
 	if statsOutPath != "" {
@@ -127,6 +135,8 @@ type sessionResult struct {
 	LatencyAvgMs    float64 `json:"latency_avg_ms"`
 	LatencyP95Ms    float64 `json:"latency_p95_ms"`
 	LatencyMaxMs    float64 `json:"latency_max_ms"`
+	JitterMs        float64 `json:"jitter_ms"` // RFC 3550 smoothed IPDV
+	DriftMs         float64 `json:"drift_ms"`  // mean(last-5 lat) − mean(first-5 lat)
 	OK              bool    `json:"ok"`
 	Error           string  `json:"error,omitempty"`
 }
@@ -139,6 +149,8 @@ type statsSummary struct {
 	E2ELatencyAvgMs float64         `json:"e2e_latency_avg_ms"`
 	E2ELatencyP95Ms float64         `json:"e2e_latency_p95_ms"`
 	E2ELatencyMaxMs float64         `json:"e2e_latency_max_ms"`
+	JitterAvgMs     float64         `json:"jitter_avg_ms"` // mean RFC 3550 jitter across sessions
+	DriftAvgMs      float64         `json:"drift_avg_ms"`  // mean drift across sessions
 	Thresholds      map[string]bool `json:"thresholds"`
 	Sessions        []sessionResult `json:"sessions"`
 }
@@ -160,6 +172,7 @@ func percentile(sorted []float64, p float64) float64 {
 // flushStats builds a summary from all completed sessions and writes it to path.
 // Called after every session completes and on SIGTERM, so report.py always sees
 // a valid file even if the pipeline is killed early.
+// Per-session aggregates are pre-computed in PushAudio; flushStats only marshals.
 func flushStats(path string) {
 	mu.Lock()
 	snap := make(map[string]sessionStats, len(completed))
@@ -169,42 +182,55 @@ func flushStats(path string) {
 	mu.Unlock()
 
 	sessResults := make([]sessionResult, 0, len(snap))
-	allLat := make([]float64, 0)
+	allP95 := make([]float64, 0, len(snap))
 	okCount := 0
 	dropPctSum := 0.0
+	jitterSum := 0.0
+	driftSum := 0.0
+	jitterN := 0
 
 	for id, s := range snap {
 		r := sessionResult{
 			SessionID:       id,
 			PacketsReceived: s.packetsReceived,
 			PacketsDropped:  s.packetsDropped,
+			LatencyAvgMs:    s.latencyAvgMs,
+			LatencyP95Ms:    s.latencyP95Ms,
+			LatencyMaxMs:    s.latencyMaxMs,
+			JitterMs:        s.jitterMs,
+			DriftMs:         s.driftMs,
 		}
-		lats := make([]float64, len(s.latenciesMs))
-		copy(lats, s.latenciesMs)
-		sort.Float64s(lats)
-		if len(lats) > 0 {
-			sum := 0.0
-			for _, v := range lats {
-				sum += v
-			}
-			r.LatencyAvgMs = sum / float64(len(lats))
-			r.LatencyP95Ms = percentile(lats, 95)
-			r.LatencyMaxMs = lats[len(lats)-1]
-			allLat = append(allLat, r.LatencyP95Ms)
+		if s.latencyP95Ms > 0 {
+			allP95 = append(allP95, s.latencyP95Ms)
 		}
+		if s.jitterMs > 0 {
+			jitterSum += s.jitterMs
+			jitterN++
+		}
+		driftSum += s.driftMs
 		r.OK = s.packetsDropped == 0 &&
 			(expectedPkts == 0 || s.packetsReceived == expectedPkts)
 		if r.OK {
 			okCount++
 		}
-		total := s.packetsReceived + s.packetsDropped
-		if total > 0 {
+		// Drop % against expected (most accurate); fall back to received+dropped.
+		if expectedPkts > 0 {
+			dropPctSum += float64(s.packetsDropped) * 100.0 / float64(expectedPkts)
+		} else if total := s.packetsReceived + s.packetsDropped; total > 0 {
 			dropPctSum += float64(s.packetsDropped) * 100.0 / float64(total)
 		}
 		sessResults = append(sessResults, r)
 	}
 
+	jitterAvg := 0.0
+	if jitterN > 0 {
+		jitterAvg = jitterSum / float64(jitterN)
+	}
 	n := len(sessResults)
+	driftAvg := 0.0
+	if n > 0 {
+		driftAvg = driftSum / float64(n)
+	}
 	sessRate := 0.0
 	if n > 0 {
 		sessRate = float64(okCount) / float64(n)
@@ -214,18 +240,18 @@ func flushStats(path string) {
 		dropAvg = dropPctSum / float64(n)
 	}
 
-	sort.Float64s(allLat)
+	sort.Float64s(allP95)
 	latAvg, latP95, latMax := 0.0, 0.0, 0.0
-	if len(allLat) > 0 {
+	if len(allP95) > 0 {
 		sum := 0.0
-		for _, v := range allLat {
+		for _, v := range allP95 {
 			sum += v
 			if v > latMax {
 				latMax = v
 			}
 		}
-		latAvg = sum / float64(len(allLat))
-		latP95 = percentile(allLat, 95)
+		latAvg = sum / float64(len(allP95))
+		latP95 = percentile(allP95, 95)
 	}
 
 	out := statsSummary{
@@ -236,6 +262,8 @@ func flushStats(path string) {
 		E2ELatencyAvgMs: latAvg,
 		E2ELatencyP95Ms: latP95,
 		E2ELatencyMaxMs: latMax,
+		JitterAvgMs:     jitterAvg,
+		DriftAvgMs:      driftAvg,
 		Thresholds: map[string]bool{
 			"e2e_latency_p95_lt_500ms": latP95 < 500,
 			"sess_ok_rate_gt_095":      sessRate > 0.95,
@@ -338,12 +366,26 @@ func (w *wavWriter) close() {
 //  3. Writes the stripped PCM directly to the WAV file (no intermediate channel).
 //  4. Forwards the packet non-blocking into sess.ch for any connected ReceiveAudio.
 func (b *bridgeServer) PushAudio(stream pb.AudioForwardService_PushAudioServer) error {
+	const driftN = 5
 	var (
 		sid         string
 		sess        *session
 		pktsRecv    uint64
 		ww          *wavWriter
 		latenciesMs []float64
+		// RFC 3550 jitter: smoothed inter-packet delay variation
+		// transit(i) = bridgeRecvUs(i) − clientSendTsUs(i)
+		// J(i) = J(i−1) + (|transit(i)−transit(i−1)| − J(i−1)) / 16
+		// Clock offset cancels in the difference, so cross-clock jitter is accurate.
+		prevTransitUs int64
+		jitterUs      float64
+		jitterInit    bool
+		// Drift: mean(last driftN latencies) − mean(first driftN latencies)
+		// Positive = pipeline accumulating delay; zero = stable.
+		earlyLats [driftN]float64
+		earlyN    int
+		lateLats  [driftN]float64
+		lateIdx   int
 	)
 
 	for {
@@ -387,7 +429,23 @@ func (b *bridgeServer) PushAudio(stream pb.AudioForwardService_PushAudioServer) 
 				latMs := float64(bridgeRecvUs-clientSendTsUs) / 1000.0
 				if latMs >= 0 && latMs < 60_000 {
 					latenciesMs = append(latenciesMs, latMs)
+					// Drift: accumulate first / last driftN samples.
+					if earlyN < driftN {
+						earlyLats[earlyN] = latMs
+						earlyN++
+					}
+					lateLats[lateIdx%driftN] = latMs
+					lateIdx++
 				}
+				// RFC 3550 jitter using transit = recvUs − sendUs.
+				// Clock offset is constant per session and cancels in the diff.
+				transitUs := bridgeRecvUs - clientSendTsUs
+				if jitterInit {
+					d := math.Abs(float64(transitUs - prevTransitUs))
+					jitterUs += (d - jitterUs) / 16
+				}
+				prevTransitUs = transitUs
+				jitterInit = true
 			}
 		}
 
@@ -431,15 +489,55 @@ func (b *bridgeServer) PushAudio(stream pb.AudioForwardService_PushAudioServer) 
 		}
 		remove(sid)
 	}
-	log.Printf("[%s] PushAudio closed  recv=%d  e2e_samples=%d",
-		shortID(sid), pktsRecv, len(latenciesMs))
+	// Compute final jitter (ms) and drift (ms) for this session.
+	jitterMs := jitterUs / 1000.0
+	var driftMs float64
+	if earlyN >= 2 && lateIdx >= 2 {
+		var earlySum, lateSum float64
+		for i := 0; i < earlyN; i++ {
+			earlySum += earlyLats[i]
+		}
+		lateN := lateIdx
+		if lateN > driftN {
+			lateN = driftN
+		}
+		for i := 0; i < lateN; i++ {
+			lateSum += lateLats[i]
+		}
+		driftMs = (lateSum/float64(lateN) - earlySum/float64(earlyN))
+	}
+
+	// Compute per-session latency aggregates once here (O(n log n) per session,
+	// never repeated). flushStats just reads pre-computed scalars — O(1) per session.
+	var latAvgMs, latP95Ms, latMaxMs float64
+	if len(latenciesMs) > 0 {
+		sorted := make([]float64, len(latenciesMs))
+		copy(sorted, latenciesMs)
+		sort.Float64s(sorted)
+		sum := 0.0
+		for _, v := range sorted {
+			sum += v
+		}
+		latAvgMs = sum / float64(len(sorted))
+		latP95Ms = percentile(sorted, 95)
+		latMaxMs = sorted[len(sorted)-1]
+	}
+
+	// Derive drop count from expectedPkts when set; otherwise assume 0.
+	var pktsDropped uint64
+	if expectedPkts > 0 && pktsRecv < expectedPkts {
+		pktsDropped = expectedPkts - pktsRecv
+	}
+
+	log.Printf("[%s] PushAudio closed  recv=%d  dropped=%d  e2e_samples=%d  jitter=%.2fms  drift=%+.2fms",
+		shortID(sid), pktsRecv, pktsDropped, len(latenciesMs), jitterMs, driftMs)
 	if sid != "" {
-		storeStats(sid, pktsRecv, 0, latenciesMs)
+		storeStats(sid, pktsRecv, pktsDropped, latAvgMs, latP95Ms, latMaxMs, jitterMs, driftMs)
 	}
 	return stream.SendAndClose(&pb.PushResult{
 		SessionId:       sid,
 		PacketsReceived: pktsRecv,
-		PacketsDropped:  0,
+		PacketsDropped:  pktsDropped,
 	})
 }
 

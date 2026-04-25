@@ -157,8 +157,8 @@ while pos + 8 <= len(data):
         sr       = struct.unpack_from("<I", data, 24)[0]
         bits     = struct.unpack_from("<H", data, 34)[0]
         channels = struct.unpack_from("<H", data, 22)[0]
-        bpms     = sr * (bits // 8) * channels // 1000
-        chunk_b  = max(1, bpms * chunk_ms)
+        bpms     = sr * (bits // 8) * channels
+        chunk_b  = max(1, (bpms * chunk_ms) // 1000)
         print(math.ceil(sz / chunk_b))
         sys.exit(0)
     pos += 8 + sz + (sz % 2)

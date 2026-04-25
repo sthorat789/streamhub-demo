@@ -457,7 +457,8 @@ def build_e2e_table(summary: dict) -> str:
             "✓ p95<500ms" if thresholds.get("e2e_latency_p95_lt_500ms") else "✗ p95<500ms",
             "95th-percentile of (Bridge receive time − k6 send timestamp). "
             "Measures the full pipeline: k6 → WS → StreamHub → gRPC → Bridge. "
-            "Clock offset cancels out because both timestamps use the same wall clock.",
+            "Unbiased only when k6 and Bridge share the same host/clock (CI default); "
+            "in multi-host setups clock skew directly biases the reported value.",
         ),
         (
             "Session success rate",
