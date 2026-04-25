@@ -206,3 +206,13 @@ export function sendAudio() {
   wsOk.add(ok ? 1 : 0);
   check(res, { "WS connected (101)": () => ok });
 }
+
+// ─── Summary export ────────────────────────────────────────────────────────────
+// --summary-export was removed in k6 v0.55.  handleSummary() is the modern
+// replacement and produces the same JSON structure.  Pass SUMMARY_FILE env var
+// to control the output path (e.g. --env SUMMARY_FILE=/path/to/k6_summary.json).
+export function handleSummary(data) {
+  const path = __ENV.SUMMARY_FILE;
+  if (!path) return {};
+  return { [path]: JSON.stringify(data) };
+}

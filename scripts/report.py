@@ -24,20 +24,8 @@ from datetime import datetime, timezone
 # ─── k6 summary parsing ────────────────────────────────────────────────────────
 
 METRIC_LABELS = {
-    "fwd_bridge_latency_ms": "Bridge latency",
-    "fwd_sess_lat_mean_ms":  "Session lat mean",
-    "fwd_sess_lat_p50_ms":   "Session lat p50",
-    "fwd_sess_lat_p95_ms":   "Session lat p95",
-    "fwd_sess_lat_p99_ms":   "Session lat p99",
-    "fwd_sess_jitter_ms":    "Jitter",
-    "fwd_sess_buf_delay_ms": "Buffer delay (p95−p50)",
-    "fwd_sess_mos":          "MOS score",
-    "fwd_sess_drop_pct":     "Drop %",
-    "fwd_ws_conn_ms":        "WS connect time",
-    "fwd_sess_ok":           "Session success rate",
-    "fwd_pkts_expected":     "Packets expected",
-    "fwd_pkts_received":     "Packets received",
-    "fwd_pkts_dropped":      "Packets dropped",
+    "fwd_ws_conn_ms": "WS connect time",
+    "fwd_ws_ok":      "Session success rate",
 }
 
 
@@ -155,11 +143,7 @@ def quality_all_pass(results: list[dict]) -> bool:
 def latency_chart_data(summary: dict) -> str:
     labels, avg_vals, p95_vals = [], [], []
     trend_keys = [
-        ("fwd_bridge_latency_ms", "Bridge latency"),
-        ("fwd_sess_lat_p50_ms",   "Sess p50"),
-        ("fwd_sess_lat_p95_ms",   "Sess p95"),
-        ("fwd_sess_jitter_ms",    "Jitter"),
-        ("fwd_sess_buf_delay_ms", "Buf delay"),
+        ("fwd_ws_conn_ms", "WS connect time"),
     ]
     for key, label in trend_keys:
         m = summary.get("metrics", {}).get(key)
@@ -375,6 +359,8 @@ def build_e2e_table(summary: dict) -> str:
         ("E2E latency p95", f"{summary.get('e2e_latency_p95_ms', 0):.2f} ms", "✓ p95<500ms" if summary.get('thresholds', {}).get('e2e_latency_p95_lt_500ms') else "✗ p95<500ms"),
         ("Session success rate", f"{summary.get('sess_ok_rate', 0)*100:.1f}%", "✓ rate>95%" if summary.get('thresholds', {}).get('sess_ok_rate_gt_095') else "✗ rate>95%"),
         ("Avg drop %", f"{summary.get('sess_drop_pct_avg', 0):.2f}%", "✓ avg<1%" if summary.get('thresholds', {}).get('sess_drop_pct_avg_lt_1') else "✗ avg<1%"),
+        ("Jitter avg (RFC 3550)", f"{summary.get('jitter_avg_ms', 0):.3f} ms", "—"),
+        ("Drift avg (last−first 5)", f"{summary.get('drift_avg_ms', 0):+.2f} ms", "—"),
         ("Expected packets/session", str(int(summary.get('expected_packets', 0))), "—"),
         ("Sessions probed", str(int(summary.get('session_count', 0))), "—"),
     ]

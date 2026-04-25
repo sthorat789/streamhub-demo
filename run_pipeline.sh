@@ -187,7 +187,7 @@ if [[ "$NO_K6" == false ]]; then
   # Pass an absolute path so it works regardless of where k6 is invoked from.
   K6_AUDIO_FILE="$SCRIPT_DIR/$AUDIO_FILE"
   k6 run \
-    --summary-export "$RESULTS_DIR/k6_summary.json" \
+    --env SUMMARY_FILE="$RESULTS_DIR/k6_summary.json" \
     --env WS_URL="ws://127.0.0.1:$WS_PORT" \
     --env AUDIO_FILE="$K6_AUDIO_FILE" \
     --env CHUNK_MS="$CHUNK_MS" \
