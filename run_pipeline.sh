@@ -241,7 +241,7 @@ if [[ "$NO_K6" == false ]]; then
     "$PYTHON" scripts/quality_check.py \
       --ref "$SCRIPT_DIR/$AUDIO_FILE" \
       --rec-dir "$RECORD_DIR" \
-      --json > "$RESULTS_DIR/quality.json" 2>&1 || true
+      --json > "$RESULTS_DIR/quality.json" 2> "$RESULTS_DIR/quality.log" || true
 
     # Human-readable table to stdout
     "$PYTHON" scripts/quality_check.py \
@@ -253,7 +253,7 @@ if [[ "$NO_K6" == false ]]; then
   # ── HTML report ─────────────────────────────────────────────────────────────
   echo "==> Generating HTML report..."
   QUALITY_ARG=""
-  if [[ -f "$RESULTS_DIR/quality.json" ]]; then
+  if [[ -s "$RESULTS_DIR/quality.json" ]]; then
     QUALITY_ARG="--quality $RESULTS_DIR/quality.json"
   fi
   K6_ARG=""

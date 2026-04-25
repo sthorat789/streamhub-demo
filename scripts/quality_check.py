@@ -208,7 +208,13 @@ def main():
     )
     files = sorted(glob.glob(pattern))
     if not files:
-        print(f"No WAV files found: {pattern}", file=sys.stderr)
+        msg = f"No WAV files found: {pattern}"
+        if args.json:
+            print(json.dumps([
+                {"session": os.path.basename(os.path.abspath(args.rec_dir)) or args.rec_dir, "error": msg}
+            ], indent=2))
+        else:
+            print(msg, file=sys.stderr)
         sys.exit(1)
 
     if not args.json:

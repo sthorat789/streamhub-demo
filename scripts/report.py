@@ -132,12 +132,22 @@ def k6_rows(summary: dict) -> list[dict]:
 def parse_quality(path: str) -> list[dict]:
     if not path or not os.path.isfile(path):
         return []
-    with open(path) as f:
-        return json.load(f)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except json.JSONDecodeError as exc:
+        return [{
+            "session": "quality",
+            "error": f"invalid quality JSON in {os.path.basename(path)}: {exc.msg}",
+        }]
 
 
 def quality_all_pass(results: list[dict]) -> bool:
-    return all(r.get("pass", False) for r in results if "error" not in r)
+    if not results:
+        return False
+    if any("error" in r for r in results):
+        return False
+    return all(r.get("pass", False) for r in results)
 
 
 # ─── Chart.js data for latency ─────────────────────────────────────────────────
@@ -391,12 +401,13 @@ def main():
     summary  = parse_k6_summary(args.k6_summary)
     e2e      = parse_e2e_summary(args.e2e_summary)
     quality  = parse_quality(args.quality)
+    quality_enabled = bool(args.quality)
 
     ts       = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     rows     = k6_rows(summary)
     k6_pass  = all(r["ok"] for r in rows) if rows else True
     e2e_pass = all(e2e.get("thresholds", {}).values()) if e2e else True
-    q_pass   = quality_all_pass(quality)        if quality else True
+    q_pass   = quality_all_pass(quality) if quality_enabled else True
     overall  = k6_pass and e2e_pass and q_pass
     cdata    = latency_chart_data(summary)
 

@@ -126,6 +126,12 @@ func runSession(stub pb.AudioForwardServiceClient, sid string, waitS uint32, tim
 	deadline := time.Now().Add(timeout)
 
 	var stream pb.AudioForwardService_ReceiveAudioClient
+	var streamCancel context.CancelFunc
+	defer func() {
+		if streamCancel != nil {
+			streamCancel()
+		}
+	}()
 	for {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
@@ -142,11 +148,12 @@ func runSession(stub pb.AudioForwardServiceClient, sid string, waitS uint32, tim
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), remaining)
 		s, err := stub.ReceiveAudio(ctx, &pb.ReceiveRequest{SessionId: sid, WaitS: attemptWait})
-		cancel()
 		if err == nil {
 			stream = s
+			streamCancel = cancel
 			break
 		}
+		cancel()
 		code := status.Code(err)
 		if code == codes.DeadlineExceeded || code == codes.NotFound {
 			time.Sleep(200 * time.Millisecond)
