@@ -197,6 +197,15 @@ if [[ "$NO_K6" == false ]]; then
     tests/k6/k6_audio_pipeline.js
   echo ""
 
+  # In --k6-only mode Bridge is started externally (by CI) and writes its stats
+  # to a fixed path.  Copy into RESULTS_DIR so quality check and report find it.
+  if [[ "$K6_ONLY" == true ]]; then
+    BRIDGE_STATS="$SCRIPT_DIR/results/e2e_latency.json"
+    if [[ -f "$BRIDGE_STATS" ]]; then
+      cp "$BRIDGE_STATS" "$RESULTS_DIR/e2e_latency.json"
+    fi
+  fi
+
 
   # ── Quality check ───────────────────────────────────────────────────────────
   if [[ -n "$RECORD_DIR" ]]; then

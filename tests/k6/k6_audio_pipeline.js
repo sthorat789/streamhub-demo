@@ -152,10 +152,11 @@ function stampBinaryFrame(pcmBuf) {
 }
 
 // ─── Session ID ────────────────────────────────────────────────────────────────
-// Each VU runs one long-lived iteration. Use the test-wide VU id as the session
-// suffix so concurrent senders don't collapse onto the same Bridge session.
+// Use exec.scenario.iterationInTest — a globally unique counter across all VUs
+// in the scenario. This ensures every iteration gets a distinct session ID so
+// Bridge never overwrites a WAV from a previous iteration of the same VU.
 function sessionId() {
-  return `ld-${exec.vu.idInTest - 1}`;
+  return `ld-${exec.scenario.iterationInTest}`;
 }
 
 // ─── (removed: receiveAudio — latency is now measured inside Bridge) ────────── //
@@ -163,9 +164,8 @@ function sessionId() {
 export function receiveAudio() {}
 
 // ─── Scenario: sendAudio ──────────────────────────────────────────────────────
-// Used by both load_receiver and load_sender (sendAudio).
-// Connects to StreamHub via WebSocket and streams the reference WAV file.
-
+// Connects to StreamHub via WebSocket and streams the full reference WAV file.
+// Bridge extracts the K6TS timestamp from each binary frame to compute e2e latency.
 export function sendAudio() {
   const sid    = sessionId();
   const tStart = Date.now();
